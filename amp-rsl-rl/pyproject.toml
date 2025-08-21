@@ -1,0 +1,54 @@
+[build-system]
+requires = [
+    "setuptools>=61.0",
+    "setuptools_scm>=7.0",
+    "wheel"  # Added for better binary distribution support
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "amp-rsl-rl"
+description = "Adversarial Motion Prior (AMP) reinforcement learning extension for PPO based on RSL-RL."
+authors = [
+    { name = "Giulio Romualdi", email = "giulio.romualdi@iit.it" },
+    { name = "Giuseppe L'Erario", email = "giuseppe.lerario@iit.it" }
+]
+maintainers = [  # Added separate maintainers section
+    { name = "Giulio Romualdi", email = "giulio.romualdi@iit.it" },
+    { name = "Giuseppe L'Erario", email = "giuseppe.lerario@iit.it" }
+]
+license = { file = "LICENSE" }
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [  # Added standard PyPI classifiers
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence"
+]
+keywords = ["reinforcement-learning", "robotics", "motion-priors", "ppo"]
+dependencies = [
+    "numpy>=1.21.0",
+    "scipy>=1.7.0",
+    "torch>=1.10.0",
+    "rsl-rl-lib>=2.3.0",
+]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+examples = ["huggingface_hub"]
+
+[project.urls]
+Homepage = "https://github.com/ami-iit/amp-rsl-rl"
+Repository = "https://github.com/ami-iit/amp-rsl-rl"
+BugTracker = "https://github.com/ami-iit/amp-rsl-rl/issues"
+Changelog = "https://github.com/ami-iit/amp-rsl-rl/releases"
+
+[tool.setuptools_scm]
+local_scheme = "dirty-tag"
+
+[tool.setuptools]
+packages = ["amp_rsl_rl"]

@@ -1,0 +1,17 @@
+# 忽略所有 log 文件
+*.log
+
+# 忽略 isaacgym 文件夹
+isaacgym/
+
+# 如果还有缓存或编译产物也可以一起加上
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.dll
+*.dylib
+build/
+dist/
+*.egg-info/

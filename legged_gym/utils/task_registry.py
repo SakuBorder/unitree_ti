@@ -1,0 +1,154 @@
+import os
+from datetime import datetime
+from typing import Tuple
+import torch
+import numpy as np
+import sys
+
+from rsl_rl.env import VecEnv
+from rsl_rl.runners import OnPolicyRunner
+from rsl_rl.runners.him_on_policy_runner import HIMOnPolicyRunner
+
+from legged_gym import LEGGED_GYM_ROOT_DIR, LEGGED_GYM_ENVS_DIR
+from .helpers import get_args, update_cfg_from_args, class_to_dict, get_load_path, set_seed, parse_sim_params
+from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg, LeggedRobotCfgPPO
+
+class TaskRegistry():
+    def __init__(self):
+        self.task_classes = {}
+        self.env_cfgs = {}
+        self.train_cfgs = {}
+    
+    def register(self, name: str, task_class: VecEnv, env_cfg: LeggedRobotCfg, train_cfg: LeggedRobotCfgPPO):
+        self.task_classes[name] = task_class
+        self.env_cfgs[name] = env_cfg
+        self.train_cfgs[name] = train_cfg
+    
+    def get_task_class(self, name: str) -> VecEnv:
+        return self.task_classes[name]
+    
+    def get_cfgs(self, name) -> Tuple[LeggedRobotCfg, LeggedRobotCfgPPO]:
+        train_cfg = self.train_cfgs[name]
+        env_cfg = self.env_cfgs[name]
+        # copy seed
+        env_cfg.seed = train_cfg.seed
+        return env_cfg, train_cfg
+    
+    def make_env(self, name, args=None, env_cfg=None) -> Tuple[VecEnv, LeggedRobotCfg]:
+        """ Creates an environment either from a registered namme or from the provided config file.
+
+        Args:
+            name (string): Name of a registered env.
+            args (Args, optional): Isaac Gym comand line arguments. If None get_args() will be called. Defaults to None.
+            env_cfg (Dict, optional): Environment config file used to override the registered config. Defaults to None.
+
+        Raises:
+            ValueError: Error if no registered env corresponds to 'name' 
+
+        Returns:
+            isaacgym.VecTaskPython: The created environment
+            Dict: the corresponding config file
+        """
+        # if no args passed get command line arguments
+        if args is None:
+            args = get_args()
+        # check if there is a registered env with that name
+        if name in self.task_classes:
+            task_class = self.get_task_class(name)
+        else:
+            raise ValueError(f"Task with name: {name} was not registered")
+        if env_cfg is None:
+            # load config files
+            env_cfg, _ = self.get_cfgs(name)
+        # override cfg from args (if specified)
+        env_cfg, _ = update_cfg_from_args(env_cfg, None, args) # 命令行参数会覆盖原参数，只更新了环境数
+        set_seed(env_cfg.seed)
+        # parse sim params (convert to dict first)
+        sim_params = {"sim": class_to_dict(env_cfg.sim)}
+        sim_params = parse_sim_params(args, sim_params)
+
+        env = task_class(cfg=env_cfg,
+                         sim_params=sim_params,
+                         physics_engine=args.physics_engine,
+                         sim_device=args.sim_device,
+                         headless=args.headless)
+        return env, env_cfg
+
+    def make_alg_runner(self, env, name=None, args=None, train_cfg=None, log_root="default") -> Tuple[OnPolicyRunner, LeggedRobotCfgPPO]:
+        """ Creates the training algorithm  either from a registered namme or from the provided config file.
+
+        Args:
+            env (isaacgym.VecTaskPython): The environment to train (TODO: remove from within the algorithm)
+            name (string, optional): Name of a registered env. If None, the config file will be used instead. Defaults to None.
+            args (Args, optional): Isaac Gym comand line arguments. If None get_args() will be called. Defaults to None.
+            train_cfg (Dict, optional): Training config file. If None 'name' will be used to get the config file. Defaults to None.
+            log_root (str, optional): Logging directory for Tensorboard. Set to 'None' to avoid logging (at test time for example). 
+                                      Logs will be saved in <log_root>/<date_time>_<run_name>. Defaults to "default"=<path_to_LEGGED_GYM>/logs/<experiment_name>.
+
+        Raises:
+            ValueError: Error if neither 'name' or 'train_cfg' are provided
+            Warning: If both 'name' or 'train_cfg' are provided 'name' is ignored
+
+        Returns:
+            PPO: The created algorithm
+            Dict: the corresponding config file
+        """
+        # if no args passed get command line arguments
+        if args is None:
+            args = get_args()
+        # if config files are passed use them, otherwise load from the name
+        if train_cfg is None:
+            if name is None:
+                raise ValueError("Either 'name' or 'train_cfg' must be not None")
+            # load config files
+            _, train_cfg = self.get_cfgs(name)
+        else:
+            if name is not None:
+                print(f"'train_cfg' provided -> Ignoring 'name={name}'")
+        # override cfg from args (if specified)
+        _, train_cfg = update_cfg_from_args(None, train_cfg, args)
+
+        if log_root=="default":
+            log_root = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', train_cfg.runner.experiment_name)
+            log_dir = os.path.join(log_root, datetime.now().strftime('%b%d_%H-%M-%S') + '_' + train_cfg.runner.run_name)
+        elif log_root is None:
+            log_dir = None
+        else:
+            log_dir = os.path.join(log_root, datetime.now().strftime('%b%d_%H-%M-%S') + '_' + train_cfg.runner.run_name)
+        
+        train_cfg_dict = class_to_dict(train_cfg)
+        # runner = OnPolicyRunner(env, train_cfg_dict, log_dir, device=args.rl_device)
+        runner = HIMOnPolicyRunner(env, train_cfg_dict, log_dir, device=args.rl_device)
+        #save resume path before creating a new log_dir
+        resume = train_cfg.runner.resume
+        if resume:
+            # load previously trained model
+            # resume_path = get_load_path(log_root, load_run=train_cfg.runner.load_run, checkpoint=train_cfg.runner.checkpoint)
+            # resume_path = '/home/xu/Xu/research/human01/model_5000.pt' #walk
+            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug09_13-46-16_tiv2/model_2000.pt' #walk
+            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug10_15-53-13_tiv2/model_15500.pt'
+            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug11_18-09-54_tiv2/model_4000.pt'
+            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug11_19-41-00_tiv2/model_21500.pt'
+            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug12_12-50-46_tiv2/model_4000.pt'
+            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug12_14-01-55_tiv2/model_25500.pt' # history
+            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug12_21-24-59_tiv2/model_5500.pt' # 0.6 vel, 1.1 period
+            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug12_21-27-39_tiv2/model_5500.pt' # # 0.9 vel, 0.9 period
+            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug13_01-22-42_tiv2/model_2000.pt' # 0.6vel,0.9 period lin_acc+contact_momentum
+            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug13_01-22-56_tiv2/model_22000.pt' # 0.6vel,0.9 period contact_momentum
+            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug13_09-51-54_tiv2/model_1500.pt' # 0.6vel,0.9 period lin_acc+contact_momentum,0.145 feet height
+            resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug13_12-54-51_tiv2/model_4500.pt'
+            # resume_path =   '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug13_17-59-21_tiv2/model_10000.pt'
+            # resume_path =   '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug14_00-14-13_tiv2/model_17500.pt'
+            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug14_14-46-26_tiv2/model_20000.pt'
+            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug14_18-26-14_tiv2/model_28000.pt'
+            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug14_22-57-47_tiv2/model_30000.pt'
+            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug15_13-35-09_tiv2/model_41500.pt'
+            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug17_13-20-43_tiv2/model_49000.pt'
+            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug18_10-06-37_tiv2/model_6500.pt'
+            resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug18_16-15-43_tiv2/model_4000.pt'
+            print(f"Loading model from: {resume_path}")
+            runner.load(resume_path)
+        return runner, train_cfg
+
+# make global task registry
+task_registry = TaskRegistry()
