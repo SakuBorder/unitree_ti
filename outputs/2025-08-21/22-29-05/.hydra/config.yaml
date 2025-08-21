@@ -1,0 +1,192 @@
+humanoid_type: taihu
+bias_offset: false
+has_self_collision: true
+has_mesh: false
+has_jt_limit: false
+has_dof_subset: true
+has_upright_start: true
+has_smpl_pd_offset: false
+remove_toe: false
+motion_sym_loss: false
+sym_loss_coef: 1
+big_ankle: true
+has_shape_obs: true
+has_shape_obs_disc: false
+has_shape_variation: false
+masterfoot: false
+freeze_toe: false
+freeze_hand: false
+box_body: true
+real_weight: true
+real_weight_porpotion_capsules: true
+real_weight_porpotion_boxes: true
+body_names:
+- pelvis
+- L_HIP_P_S
+- L_HIP_R_S
+- L_HIP_Y_S
+- L_KNEE_P_S
+- L_ANKLE_P_S
+- L_ANKLE_R_S
+- R_HIP_P_S
+- R_HIP_R_S
+- R_HIP_Y_S
+- R_KNEE_P_S
+- R_ANKLE_P_S
+- R_ANKLE_R_S
+- WAIST_Y_S
+- WAIST_R_S
+- WAIST_P_S
+- L_SHOULDER_P_S
+- L_SHOULDER_R_S
+- L_SHOULDER_Y_S
+- L_ELBOW_Y_S
+- L_WRIST_P_S
+- L_WRIST_Y_S
+- L_WRIST_R_S
+- NECK_Y_S
+- R_SHOULDER_P_S
+- R_SHOULDER_R_S
+- R_SHOULDER_Y_S
+- R_ELBOW_Y_S
+- R_WRIST_P_S
+- R_WRIST_Y_S
+- R_WRIST_R_S
+limb_weight_group:
+- - L_HIP_P_S
+  - L_HIP_R_S
+  - L_HIP_Y_S
+  - L_KNEE_P_S
+  - L_ANKLE_P_S
+  - L_ANKLE_R_S
+- - R_HIP_P_S
+  - R_HIP_R_S
+  - R_HIP_Y_S
+  - R_KNEE_P_S
+  - R_ANKLE_P_S
+  - R_ANKLE_R_S
+- - pelvis
+  - NECK_Y_S
+- - L_SHOULDER_P_S
+  - L_SHOULDER_R_S
+  - L_SHOULDER_Y_S
+  - L_ELBOW_Y_S
+  - L_WRIST_P_S
+  - L_WRIST_Y_S
+  - L_WRIST_R_S
+- - R_SHOULDER_P_S
+  - R_SHOULDER_R_S
+  - R_SHOULDER_Y_S
+  - R_ELBOW_Y_S
+  - R_WRIST_P_S
+  - R_WRIST_Y_S
+  - R_WRIST_R_S
+dof_names:
+- pelvis
+- L_HIP_P_S
+- L_HIP_R_S
+- L_HIP_Y_S
+- L_KNEE_P_S
+- L_ANKLE_P_S
+- L_ANKLE_R_S
+- R_HIP_P_S
+- R_HIP_R_S
+- R_HIP_Y_S
+- R_KNEE_P_S
+- R_ANKLE_P_S
+- R_ANKLE_R_S
+- WAIST_Y_S
+- WAIST_R_S
+- WAIST_P_S
+- L_SHOULDER_P_S
+- L_SHOULDER_R_S
+- L_SHOULDER_Y_S
+- L_ELBOW_Y_S
+- L_WRIST_P_S
+- L_WRIST_Y_S
+- L_WRIST_R_S
+- NECK_Y_S
+- R_SHOULDER_P_S
+- R_SHOULDER_R_S
+- R_SHOULDER_Y_S
+- R_ELBOW_Y_S
+- R_WRIST_P_S
+- R_WRIST_Y_S
+- R_WRIST_R_S
+right_foot_name: r_foot_roll
+left_foot_name: l_foot_roll
+asset:
+  assetRoot: /home/dy/dy/code/PHC/phc/data/assets/robot/taihu/
+  assetFileName: /home/dy/dy/code/PHC/phc/data/assets/robot/taihu/taihu.xml
+  urdfFileName: taihu.urdf
+base_link: WAIST_Y_S
+joint_matches:
+- - head_link
+  - Head
+- - pelvis
+  - Pelvis
+- - L_HIP_P_S
+  - L_Hip
+- - L_KNEE_P_S
+  - L_Knee
+- - L_ANKLE_R_S
+  - L_Ankle
+- - R_HIP_P_S
+  - R_Hip
+- - R_KNEE_P_S
+  - R_Knee
+- - R_ANKLE_R_S
+  - R_Ankle
+- - L_SHOULDER_R_S
+  - L_Shoulder
+- - L_ELBOW_Y_S
+  - L_Elbow
+- - L_WRIST_R_S
+  - L_Wrist
+- - R_SHOULDER_R_S
+  - R_Shoulder
+- - R_ELBOW_Y_S
+  - R_Elbow
+- - R_WRIST_R_S
+  - R_Wrist
+- - NECK_Y_S
+  - Neck
+extend_config:
+- joint_name: head_link
+  parent_name: pelvis
+  pos:
+  - 0.0
+  - 0.0
+  - 0.4
+  rot:
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+- joint_name: left_toe_link
+  parent_name: L_ANKLE_R_S
+  pos:
+  - 0.08
+  - 0.0
+  - 0.0
+  rot:
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+- joint_name: right_toe_link
+  parent_name: R_ANKLE_R_S
+  pos:
+  - 0.08
+  - 0.0
+  - 0.0
+  rot:
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+smpl_pose_modifier:
+- Pelvis: '[np.pi/2, 0, np.pi/2]'
+pkl_root: /home/dy/dy/code/unitree_ti/amp-rsl-rl/amp_datasets/pkl
+fit_all: true
+fitting_iterations: 500

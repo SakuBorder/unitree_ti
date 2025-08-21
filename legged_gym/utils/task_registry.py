@@ -136,7 +136,7 @@ class TaskRegistry():
             # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug13_01-22-42_tiv2/model_2000.pt' # 0.6vel,0.9 period lin_acc+contact_momentum
             # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug13_01-22-56_tiv2/model_22000.pt' # 0.6vel,0.9 period contact_momentum
             # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug13_09-51-54_tiv2/model_1500.pt' # 0.6vel,0.9 period lin_acc+contact_momentum,0.145 feet height
-            resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug13_12-54-51_tiv2/model_4500.pt'
+            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug13_12-54-51_tiv2/model_4500.pt'
             # resume_path =   '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug13_17-59-21_tiv2/model_10000.pt'
             # resume_path =   '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug14_00-14-13_tiv2/model_17500.pt'
             # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug14_14-46-26_tiv2/model_20000.pt'
@@ -145,7 +145,9 @@ class TaskRegistry():
             # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug15_13-35-09_tiv2/model_41500.pt'
             # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug17_13-20-43_tiv2/model_49000.pt'
             # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug18_10-06-37_tiv2/model_6500.pt'
-            resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug18_16-15-43_tiv2/model_4000.pt'
+            # resume_path = '/home/dy/dy/code/unitree_ti/logs/ti-12dof-realpd/Aug21_18-32-19_tiv2/model_11000.pt'
+            resume_path = '/home/dy/dy/code/unitree_ti/logs/ti-12dof-realpd/Aug21_21-22-26_tiv2/model_11500.pt'
+
             print(f"Loading model from: {resume_path}")
             runner.load(resume_path)
         return runner, train_cfg

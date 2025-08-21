@@ -7,7 +7,7 @@ from legged_gym import LEGGED_GYM_ROOT_DIR
 import os
 import sys
 from legged_gym import LEGGED_GYM_ROOT_DIR
-
+sys.path.insert(0, '/home/dy/dy/code/unitree_ti/rsl_rl')
 import isaacgym
 from legged_gym.envs import *
 from legged_gym.utils import  get_args, export_policy_as_jit, task_registry, Logger
