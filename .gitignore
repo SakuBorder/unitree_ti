@@ -3,6 +3,9 @@
 
 # 忽略 isaacgym 文件夹
 isaacgym/
+debug/
+log/
+rl_amp/
 
 # 如果还有缓存或编译产物也可以一起加上
 __pycache__/

@@ -4,8 +4,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 from pathlib import Path
-from typing import List, Union, Tuple, Generator
+from typing import List, Union, Tuple, Generator, Optional
 from dataclasses import dataclass
+import joblib
 
 import torch
 import numpy as np
@@ -48,7 +49,14 @@ def download_amp_dataset_from_hf(
         # Deep copy to avoid symlinks
         with open(file_path, "rb") as src_file, open(local_copy, "wb") as dst_file:
             dst_file.write(src_file.read())
-        dataset_names.append(file.replace(".npy", ""))
+        
+        # Remove extension for dataset name
+        if file.endswith('.npy'):
+            dataset_names.append(file.replace(".npy", ""))
+        elif file.endswith('.pkl'):
+            dataset_names.append(file.replace(".pkl", ""))
+        else:
+            dataset_names.append(file)
 
     return dataset_names
 
@@ -66,9 +74,9 @@ class MotionData:
         - joint_positions: shape (T, N)
         - joint_velocities: shape (T, N)
         - base_lin_velocities_mixed: linear velocity in world frame
-        - base_ang_velocities_mixed: (currently zeros)
+        - base_ang_velocities_mixed: angular velocity in world frame
         - base_lin_velocities_local: linear velocity in local (body) frame
-        - base_ang_velocities_local: (currently zeros)
+        - base_ang_velocities_local: angular velocity in local frame
         - base_quat: orientation quaternion as torch.Tensor in wxyz order
 
     Notes:
@@ -111,6 +119,15 @@ class MotionData:
                 device=self.device,
                 dtype=torch.float32,
             )
+        elif isinstance(self.base_quat, np.ndarray):
+            # Assume it's already in xyzw format from PKL
+            if self.base_quat.shape[-1] == 4:
+                # Convert xyzw to wxyz
+                self.base_quat = torch.tensor(
+                    self.base_quat[:, [3, 0, 1, 2]],
+                    device=self.device,
+                    dtype=torch.float32,
+                )
 
     def __len__(self) -> int:
         return self.joint_positions.shape[0]
@@ -160,26 +177,35 @@ class MotionData:
 
 class AMPLoader:
     """
-    Loader and processor for humanoid motion capture datasets in AMP format.
+    Extended loader and processor for humanoid motion capture datasets in AMP format.
+    Now supports both NPY (original AMP format) and PKL (retargeted format) files.
 
     Responsibilities:
-      - Loading .npy files containing motion data
+      - Loading .npy and .pkl files containing motion data
       - Building a unified joint ordering across all datasets
       - Resampling trajectories to match the simulator's timestep
       - Computing derived quantities (velocities, local-frame motion)
       - Returning torch-friendly MotionData instances
 
     Dataset format:
-        Each .npy contains a dict with keys:
+        NPY format - Each .npy contains a dict with keys:
           - "joints_list": List[str]
           - "joint_positions": List[np.ndarray]
           - "root_position": List[np.ndarray]
           - "root_quaternion": List[np.ndarray] (xyzw)
           - "fps": float (frames/sec)
+        
+        PKL format - Each .pkl contains a dict with motion name as key, value dict with:
+          - "root_trans_offset": np.ndarray (T, 3)
+          - "pose_aa": np.ndarray (T, num_bodies, 3) - axis-angle representation
+          - "dof": np.ndarray (T, num_dof) - joint angles
+          - "root_rot": np.ndarray (T, 4) - quaternion in xyzw
+          - "smpl_joints": np.ndarray (T, J, 3) - optional, for reference
+          - "fps": float
 
     Args:
         device: Target torch device ('cpu' or 'cuda')
-        dataset_path_root: Directory containing the .npy motion files
+        dataset_path_root: Directory containing the motion files
         dataset_names: List of dataset filenames (no extension)
         dataset_weights: List of sampling weights (for minibatch sampling)
         simulation_dt: Timestep used by the simulator
@@ -201,34 +227,62 @@ class AMPLoader:
         if isinstance(dataset_path_root, str):
             dataset_path_root = Path(dataset_path_root)
 
-        # ─── Build union of all joint names if not provided ───
+        # Detect file formats for each dataset
+        self.dataset_formats = {}
+        for name in dataset_names:
+            npy_path = dataset_path_root / f"{name}.npy"
+            pkl_path = dataset_path_root / f"{name}.pkl"
+            
+            if npy_path.exists():
+                self.dataset_formats[name] = 'npy'
+            elif pkl_path.exists():
+                self.dataset_formats[name] = 'pkl'
+            else:
+                raise FileNotFoundError(f"Neither {npy_path} nor {pkl_path} found")
+
+        # Build union of all joint names if not provided
         if expected_joint_names is None:
             joint_union: List[str] = []
             seen = set()
             for name in dataset_names:
-                p = dataset_path_root / f"{name}.npy"
-                info = np.load(str(p), allow_pickle=True).item()
-                for j in info["joints_list"]:
-                    if j not in seen:
-                        seen.add(j)
-                        joint_union.append(j)
-            expected_joint_names = joint_union
-        # ─────────────────────────────────────────────────────────
+                if self.dataset_formats[name] == 'npy':
+                    p = dataset_path_root / f"{name}.npy"
+                    info = np.load(str(p), allow_pickle=True).item()
+                    for j in info["joints_list"]:
+                        if j not in seen:
+                            seen.add(j)
+                            joint_union.append(j)
+                # For PKL files, we'll use the provided expected_joint_names or skip joint name extraction
+            expected_joint_names = joint_union if joint_union else []
 
         # Load and process each dataset into MotionData
         self.motion_data: List[MotionData] = []
         for dataset_name in dataset_names:
-            dataset_path = dataset_path_root / f"{dataset_name}.npy"
-            md = self.load_data(
-                dataset_path,
-                simulation_dt,
-                slow_down_factor,
-                expected_joint_names,
-            )
-            self.motion_data.append(md)
+            dataset_path = dataset_path_root / f"{dataset_name}.{self.dataset_formats[dataset_name]}"
+            
+            if self.dataset_formats[dataset_name] == 'npy':
+                md = self.load_npy_data(
+                    dataset_path,
+                    simulation_dt,
+                    slow_down_factor,
+                    expected_joint_names,
+                )
+            else:  # pkl
+                md = self.load_pkl_data(
+                    dataset_path,
+                    simulation_dt,
+                    slow_down_factor,
+                    expected_joint_names,
+                )
+            
+            if md is not None:
+                self.motion_data.append(md)
+
+        if not self.motion_data:
+            raise ValueError("No valid motion data loaded")
 
         # Normalize dataset-level sampling weights
-        weights = torch.tensor(dataset_weights, dtype=torch.float32, device=self.device)
+        weights = torch.tensor(dataset_weights[:len(self.motion_data)], dtype=torch.float32, device=self.device)
         self.dataset_weights = weights / weights.sum()
 
         # Precompute flat buffers for fast sampling
@@ -262,20 +316,25 @@ class AMPLoader:
 
     def _resample_data_Rn(
         self,
-        data: List[np.ndarray],
+        data: Union[List[np.ndarray], np.ndarray],
         original_keyframes,
         target_keyframes,
     ) -> np.ndarray:
-        f = interp1d(original_keyframes, data, axis=0)
+        """Resample data in R^n space using linear interpolation"""
+        if isinstance(data, list):
+            data = np.array(data)
+        f = interp1d(original_keyframes, data, axis=0, fill_value="extrapolate")
         return f(target_keyframes)
 
     def _resample_data_SO3(
         self,
-        raw_quaternions: List[np.ndarray],
+        raw_quaternions: Union[List[np.ndarray], np.ndarray],
         original_keyframes,
         target_keyframes,
     ) -> Rotation:
-
+        """Resample rotations using SLERP"""
+        if isinstance(raw_quaternions, list):
+            raw_quaternions = np.array(raw_quaternions)
         # the quaternion is expected in the dataset as `xyzw` format (SciPy default)
         tmp = Rotation.from_quat(raw_quaternions)
         slerp = Slerp(original_keyframes, tmp)
@@ -287,6 +346,7 @@ class AMPLoader:
         dt: float,
         local: bool = False,
     ) -> np.ndarray:
+        """Compute angular velocities from rotation sequence"""
         R_prev = data[:-1]
         R_next = data[1:]
 
@@ -303,24 +363,33 @@ class AMPLoader:
         return np.vstack((rotvec, rotvec[-1]))
 
     def _compute_raw_derivative(self, data: np.ndarray, dt: float) -> np.ndarray:
+        """Compute numerical derivative"""
         d = (data[1:] - data[:-1]) / dt
         return np.vstack([d, d[-1:]])
 
-    def load_data(
+    def load_npy_data(
         self,
         dataset_path: Path,
         simulation_dt: float,
         slow_down_factor: int = 1,
         expected_joint_names: Union[List[str], None] = None,
-    ) -> MotionData:
+    ) -> Optional[MotionData]:
         """
-        Loads and processes one motion dataset.
+        Loads and processes one NPY motion dataset.
 
         Returns:
-            MotionData instance
+            MotionData instance or None if loading fails
         """
-        data = np.load(str(dataset_path), allow_pickle=True).item()
-        dataset_joint_names = data["joints_list"]
+        try:
+            data = np.load(str(dataset_path), allow_pickle=True).item()
+        except Exception as e:
+            print(f"Failed to load NPY file {dataset_path}: {e}")
+            return None
+
+        if not expected_joint_names:
+            expected_joint_names = data.get("joints_list", [])
+
+        dataset_joint_names = data.get("joints_list", [])
 
         # build index map for expected_joint_names
         idx_map: List[Union[int, None]] = []
@@ -388,6 +457,141 @@ class AMPLoader:
             device=self.device,
         )
 
+    def load_pkl_data(
+        self,
+        dataset_path: Path,
+        simulation_dt: float,
+        slow_down_factor: int = 1,
+        expected_joint_names: Union[List[str], None] = None,
+    ) -> Optional[MotionData]:
+        """
+        Loads and processes one PKL motion dataset from retargeting.
+
+        Returns:
+            MotionData instance or None if loading fails
+        """
+        try:
+            pkl_data = joblib.load(str(dataset_path))
+        except Exception as e:
+            print(f"Failed to load PKL file {dataset_path}: {e}")
+            return None
+
+        # PKL format: {motion_name: motion_data}
+        if not isinstance(pkl_data, dict):
+            print(f"Unexpected PKL format in {dataset_path}")
+            return None
+
+        motion_key = list(pkl_data.keys())[0]
+        data = pkl_data[motion_key]
+
+        # Extract required fields
+        if "root_trans_offset" not in data or "dof" not in data:
+            print(f"Missing required fields in PKL file {dataset_path}")
+            return None
+
+        root_trans = data["root_trans_offset"]  # (T, 3)
+        dof_positions = data["dof"]  # (T, num_dof) or (T, num_dof, 1)
+        root_quat_xyzw = data.get("root_rot", None)  # (T, 4) in xyzw format
+        fps = data.get("fps", 30.0)
+
+        # Handle different dof shapes
+        if len(dof_positions.shape) == 3:
+            dof_positions = dof_positions.squeeze(-1)
+
+        # Convert to numpy if needed
+        if isinstance(root_trans, torch.Tensor):
+            root_trans = root_trans.numpy()
+        if isinstance(dof_positions, torch.Tensor):
+            dof_positions = dof_positions.numpy()
+        if isinstance(root_quat_xyzw, torch.Tensor):
+            root_quat_xyzw = root_quat_xyzw.numpy()
+
+        # Resample to match simulation timestep
+        dt = 1.0 / fps / float(slow_down_factor)
+        T = len(dof_positions)
+        t_orig = np.linspace(0, T * dt, T)
+        T_new = int(T * dt / simulation_dt)
+        if T_new == 0:
+            print(f"Motion too short in {dataset_path}")
+            return None
+        t_new = np.linspace(0, T * dt, T_new)
+
+        # Resample joint positions (DOF values)
+        resampled_joint_positions = self._resample_data_Rn(dof_positions, t_orig, t_new)
+        resampled_joint_velocities = self._compute_raw_derivative(
+            resampled_joint_positions, simulation_dt
+        )
+
+        # Resample base positions
+        resampled_base_positions = self._resample_data_Rn(root_trans, t_orig, t_new)
+        resampled_base_lin_vel_mixed = self._compute_raw_derivative(
+            resampled_base_positions, simulation_dt
+        )
+
+        # Handle rotations
+        if root_quat_xyzw is not None:
+            # PKL quaternions are in xyzw format, convert to Rotation for resampling
+            resampled_base_orientations = self._resample_data_SO3(
+                root_quat_xyzw, t_orig, t_new
+            )
+        else:
+            # If no rotation data, use identity
+            resampled_base_orientations = Rotation.identity(T_new)
+
+        # Compute angular velocities
+        resampled_base_ang_vel_mixed = self._compute_ang_vel(
+            resampled_base_orientations, simulation_dt, local=False
+        )
+        resampled_base_ang_vel_local = self._compute_ang_vel(
+            resampled_base_orientations, simulation_dt, local=True
+        )
+
+        # Compute local frame linear velocities
+        resampled_base_lin_vel_local = np.stack(
+            [
+                R.as_matrix().T @ v
+                for R, v in zip(
+                    resampled_base_orientations, resampled_base_lin_vel_mixed
+                )
+            ]
+        )
+
+        return MotionData(
+            joint_positions=resampled_joint_positions,
+            joint_velocities=resampled_joint_velocities,
+            base_lin_velocities_mixed=resampled_base_lin_vel_mixed,
+            base_ang_velocities_mixed=resampled_base_ang_vel_mixed,
+            base_lin_velocities_local=resampled_base_lin_vel_local,
+            base_ang_velocities_local=resampled_base_ang_vel_local,
+            base_quat=resampled_base_orientations,
+            device=self.device,
+        )
+
+    def load_data(
+        self,
+        dataset_path: Path,
+        simulation_dt: float,
+        slow_down_factor: int = 1,
+        expected_joint_names: Union[List[str], None] = None,
+    ) -> Optional[MotionData]:
+        """
+        Loads and processes one motion dataset (auto-detects format).
+
+        Returns:
+            MotionData instance or None if loading fails
+        """
+        if dataset_path.suffix == '.pkl':
+            return self.load_pkl_data(
+                dataset_path, simulation_dt, slow_down_factor, expected_joint_names
+            )
+        elif dataset_path.suffix == '.npy':
+            return self.load_npy_data(
+                dataset_path, simulation_dt, slow_down_factor, expected_joint_names
+            )
+        else:
+            print(f"Unsupported file format: {dataset_path.suffix}")
+            return None
+
     def feed_forward_generator(
         self, num_mini_batch: int, mini_batch_size: int
     ) -> Generator[Tuple[torch.Tensor, torch.Tensor], None, None]:
@@ -421,7 +625,13 @@ class AMPLoader:
             self.per_frame_weights, number_of_samples, replacement=True
         )
         full = self.all_states[idx]
-        joint_dim = self.motion_data[0].joint_positions.shape[1]
+        
+        # Determine joint dimension from the first motion data
+        if self.motion_data:
+            joint_dim = self.motion_data[0].joint_positions.shape[1]
+        else:
+            # Fallback estimation
+            joint_dim = (full.shape[1] - 10) // 2  # (total - 4quat - 3linvel - 3angvel) / 2
 
         # The dimensions of the full state are:
         #   - 4 (quat) + joint_dim (joint_positions) + joint_dim (joint_velocities)
