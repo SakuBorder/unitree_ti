@@ -150,7 +150,7 @@ class TaskRegistry():
             # resume_path = '/home/xu/Xu/research/human01/exp3_2.pt'
             # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug20_16-43-07_tiv2/model_13000.pt'
             # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug21_10-02-25_tiv2/model_32500.pt'
-            resume_path = '/home/dy/dy/code/unitree_ti/logs/ti-12dof-realpd/Aug22_15-57-02_tiv2/model_1000.pt'
+            resume_path = '/home/dy/dy/code/unitree_ti/logs/ti-12dof-realpd/Aug22_15-57-02_tiv2/model_3500.pt'
             print(f"Loading model from: {resume_path}")
             runner.load(resume_path)
         return runner, train_cfg
