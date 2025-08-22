@@ -6,7 +6,7 @@ class LeggedRobotCfg(BaseConfig):
         num_observations = 48
         num_privileged_obs = None # if not None a priviledge_obs_buf will be returned by step() (critic obs for assymetric training). None is returned otherwise 
         num_actions = 12
-        env_spacing = 3.  # not used with heightfields/trimeshes 
+        env_spacing = 1.5  # not used with heightfields/trimeshes 
         send_timeouts = True # send time out information to the algorithm
         episode_length_s = 16 # episode length in seconds
         test = False
@@ -25,10 +25,10 @@ class LeggedRobotCfg(BaseConfig):
         measured_points_x = [-0.8, -0.7, -0.6, -0.5, -0.4, -0.3, -0.2, -0.1, 0., 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8] # 1mx1.6m rectangle (without center line)
         measured_points_y = [-0.5, -0.4, -0.3, -0.2, -0.1, 0., 0.1, 0.2, 0.3, 0.4, 0.5]
         selected = True # select a unique terrain type and pass all arguments
-        terrain_kwargs = {'type':'terrain_utils.random_uniform_terrain','args':{ 'min_height':0.0, 'max_height':0.02, 'step':0.005, 'downsampled_scale':0.2}} # Dict of arguments for selected terrain
+        terrain_kwargs = {'type':'terrain_utils.random_uniform_terrain','args':{ 'min_height':0.0, 'max_height':0.08, 'step':0.005, 'downsampled_scale':0.2}} # Dict of arguments for selected terrain
         max_init_terrain_level = 5 # starting curriculum state
-        terrain_length = 8.
-        terrain_width = 8.
+        terrain_length = 10.
+        terrain_width = 10.
         num_rows= 10 # number of terrain rows (levels)
         num_cols = 20 # number of terrain cols (types)
         # terrain types: [smooth slope, rough slope, stairs up, stairs down, discrete]
@@ -47,9 +47,9 @@ class LeggedRobotCfg(BaseConfig):
             # lin_vel_y = [-0.5,0.5]   # min max [m/s]
             # ang_vel_yaw = [-1.0,1.0]   # min max [rad/s]
 
-            lin_vel_x = [0.5,0.5] # min max [m/s]
-            lin_vel_y = [0.3,0.3]   # min max [m/s]
-            ang_vel_yaw = [0.5,0.5]   # min max [rad/s]
+            lin_vel_x = [0.0,0.6] # min max [m/s]
+            lin_vel_y = [-0.4,0.4]   # min max [m/s]
+            ang_vel_yaw = [-0.5,0.5]   # min max [rad/s]
             heading = [-3.14, 3.14]
             # lin_vel_x = [0,1]  # min max [m/s]
             # lin_vel_y = [-0, 0]  # min max [m/s]

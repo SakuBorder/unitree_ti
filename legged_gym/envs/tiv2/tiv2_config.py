@@ -68,15 +68,23 @@ class TiV2RoughCfg(LeggedRobotCfg):
     class domain_rand(LeggedRobotCfg.domain_rand):
         randomize_friction = True
         friction_range = [0.1, 1.25]
-        randomize_base_mass = False
+
+        randomize_base_mass = True
         added_mass_range = [-0.1, 2.]
-        push_robots = False
-        push_interval_s = 5
-        max_push_vel_xy = 0.5
+
         randomize_kp = True
         kp_factor_range = [0.8, 1.2]
+
         randomize_kd = True
         kd_factor_range = [0.8, 1.2]
+
+        randomize_initial_joint_pos = True
+        initial_joint_pos_scale = [0.8, 1.2]
+        initial_joint_pos_offset = [-0.1, 0.1]
+        
+        push_robots = True
+        push_interval_s = 5
+        max_push_vel_xy = 0.5
 
     class control(LeggedRobotCfg.control):
         # PD Drive parameters:
@@ -131,7 +139,7 @@ class TiV2RoughCfg(LeggedRobotCfg):
         
         class scales( LeggedRobotCfg.rewards.scales ):
             tracking_lin_vel = 1.0
-            tracking_ang_vel = 0.5
+            tracking_ang_vel = 1.0
             lin_vel_z = -2.0
             ang_vel_xy = -0.5
             orientation = -1.0
@@ -143,7 +151,7 @@ class TiV2RoughCfg(LeggedRobotCfg):
             torques = 0.0
             dof_pos_limits = -5.0
             alive = 0.15
-            hip_pos = -50.0
+            hip_pos = -10.0
             ankle_pos = -50.0
             # contact_no_vel = -0.2
             feet_swing_height = -100.0
@@ -159,8 +167,8 @@ class TiV2RoughCfg(LeggedRobotCfg):
             feet_heading_alignment = -1.0
             
             lin_acc = -2.5e-5
-            contact_momentum = 2.5e-4
-            foot_contact_forces = -0.0025
+            contact_momentum = 2.5e-2
+            # foot_contact_forces = -0.025
 
 
 

@@ -2,12 +2,12 @@ import sys
 import os,sys
 cur_work_path = os.getcwd()
 sys.path.append(cur_work_path)
-
+sys.path.insert(0, '/home/dy/dy/code/unitree_ti/rsl_rl')
 from legged_gym import LEGGED_GYM_ROOT_DIR
 import os
 import sys
 from legged_gym import LEGGED_GYM_ROOT_DIR
-sys.path.insert(0, '/home/dy/dy/code/unitree_ti/rsl_rl')
+
 import isaacgym
 from legged_gym.envs import *
 from legged_gym.utils import  get_args, export_policy_as_jit, task_registry, Logger
@@ -54,13 +54,12 @@ def play(args):
     from torch.utils.tensorboard import SummaryWriter
     writer = SummaryWriter(log_dir=log_dir)  # 创建tensorboard写入器
     for i in range(10*int(env.max_episode_length)):
-        # obs[0][6:6+3] = torch.tensor([0.6,0.0,0.0],device='cuda') * 2.0
         actions = policy(obs.detach())
         # actions[0][5] = 0
         # actions[0][11] = 0
-        env.commands[:, 0] = 0.5
-        env.commands[:, 1] = 0
-        env.commands[:, 2] = 0
+        env.commands[:, 0] = 0.0
+        env.commands[:, 1] = 0.0
+        env.commands[:, 2] = 0.0
         obs, _, rews, dones, infos ,_,_= env.step(actions.detach())
         # time.sleep(0.1)
 

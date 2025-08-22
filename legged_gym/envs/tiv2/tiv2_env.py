@@ -162,14 +162,16 @@ class TiV2Robot(LeggedRobot):
             
     def _reward_contact(self):
         # res = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        rew = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         right = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         for i in range(self.feet_num):
             is_stance = self.leg_phase[:, i] < 0.55
             contact = self.contact_forces[:, self.feet_indices[i], 2] > 1
-            right += ~(contact ^ is_stance)
-        res = 2 * (right==2)
+            right += (~(contact ^ is_stance))
+            # right[~self.is_vel[...,0]] += ((contact) * torch.exp(-torch.norm(self.base_lin_vel[:,],dim=1)))[~self.is_vel[...,0]] 
+
+        res = 2 * (right==2) 
         # print(res)
-        # return res*self.is_vel[...,0]
         return res
 
     # def _reward_contact(self):
@@ -231,14 +233,17 @@ class TiV2Robot(LeggedRobot):
     def _reward_foot_contact_forces(self):
         # penalize high contact forces
         # print(self.contact_forces[:, self.feet_indices, :])
-        return torch.sum((torch.norm(self.contact_forces[:, self.feet_indices, :], dim=-1) -  300).clip(min=0.), dim=1)
+        # print(torch.sum((torch.norm(self.contact_forces[:, self.feet_indices, :], dim=-1) -  300).clip(min=0.), dim=1))
+        return torch.sum((torch.norm(self.contact_forces[:, self.feet_indices, :], dim=-1) -  450).clip(min=0.), dim=1)
     
     # # 惩罚 接触动量（缓慢着陆），[0,+00]
     def _reward_contact_momentum(self):
         # encourage soft contacts
+        # foot_contact_momentum_z = torch.clip(self.feet_vel[:, :, 2], max=0) * torch.clip(self.contact_forces[:, self.feet_indices, 2] - 50, min=0)
+        # return torch.sum((foot_contact_momentum_z != 0)*self.first_contacts*torch.exp(foot_contact_momentum_z/100), dim=1)
         foot_contact_momentum_z = torch.clip(self.feet_vel[:, :, 2], max=0) * torch.clip(self.contact_forces[:, self.feet_indices, 2] - 50, min=0)
-        return torch.sum(foot_contact_momentum_z, dim=1)
-    
+        return torch.sum(foot_contact_momentum_z, dim=1)    
+
     # def _reward_feet_ground_parallel(self):
     #     feet_heights, feet_heights_var = self._get_feet_heights()
     #     # continue_contact = (self.feet_air_time >= 3* self.dt) * self.contact_filt

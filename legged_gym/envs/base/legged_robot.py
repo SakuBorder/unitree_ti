@@ -429,7 +429,19 @@ class LeggedRobot(BaseTask):
         Args:
             env_ids (List[int]): Environemnt ids
         """
-        self.dof_pos[env_ids] = self.default_dof_pos
+        # self.dof_pos[env_ids] = self.default_dof_pos
+        # self.dof_vel[env_ids] = 0.
+
+        dof_upper = self.dof_pos_limits[:, 1].view(1, -1)
+        dof_lower = self.dof_pos_limits[:, 0].view(1, -1)
+
+        if self.cfg.domain_rand.randomize_initial_joint_pos:
+            init_dos_pos = self.default_dof_pos * torch_rand_float(self.cfg.domain_rand.initial_joint_pos_scale[0], self.cfg.domain_rand.initial_joint_pos_scale[1], (len(env_ids), self.num_dof), device=self.device)
+            init_dos_pos += torch_rand_float(self.cfg.domain_rand.initial_joint_pos_offset[0], self.cfg.domain_rand.initial_joint_pos_offset[1], (len(env_ids), self.num_dof), device=self.device)
+            self.dof_pos[env_ids] = torch.clip(init_dos_pos, dof_lower, dof_upper)
+        else:
+            self.dof_pos[env_ids] = self.default_dof_pos * torch.ones((len(env_ids), self.num_dof), device=self.device)
+
         self.dof_vel[env_ids] = 0.
 
         env_ids_int32 = env_ids.to(dtype=torch.int32)
@@ -453,7 +465,7 @@ class LeggedRobot(BaseTask):
             self.root_states[env_ids] = self.base_init_state
             self.root_states[env_ids, :3] += self.env_origins[env_ids]
         # base velocities
-        # self.root_states[env_ids, 7:13] = torch_rand_float(-0.5, 0.5, (len(env_ids), 6), device=self.device) # [7:10]: lin vel, [10:13]: ang vel
+        self.root_states[env_ids, 7:13] = torch_rand_float(-0.3, 0.3, (len(env_ids), 6), device=self.device) # [7:10]: lin vel, [10:13]: ang vel
         env_ids_int32 = env_ids.to(dtype=torch.int32)
         self.gym.set_actor_root_state_tensor_indexed(self.sim,
                                                      gymtorch.unwrap_tensor(self.root_states),
@@ -772,6 +784,7 @@ class LeggedRobot(BaseTask):
     #------------ reward functions----------------
     def _reward_lin_vel_z(self):
         # Penalize z axis base linear velocity
+        # print(self.base_lin_vel)
         return torch.square(self.base_lin_vel[:, 2])
     
     def _reward_ang_vel_xy(self):
@@ -836,7 +849,7 @@ class LeggedRobot(BaseTask):
     def _reward_tracking_lin_vel(self):
         # Tracking of linear velocity commands (xy axes)
         lin_vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
-        # print(self.base_lin_vel[:, :2])
+        # print(torch.exp(-lin_vel_error/self.cfg.rewards.tracking_sigma))
         return torch.exp(-lin_vel_error/self.cfg.rewards.tracking_sigma)
     
     def _reward_tracking_ang_vel(self):
@@ -863,14 +876,7 @@ class LeggedRobot(BaseTask):
              5 *torch.abs(self.contact_forces[:, self.feet_indices, 2]), dim=1)
         
     def _reward_stand_still(self):
-        # Penalize motion at zero commands
-        # print(self.is_vel.shape)
-        # return torch.sum(torch.abs(self.dof_pos - self.default_dof_pos), dim=1) * (~self.is_vel[...,0])
-        # rew = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
-        # index =  self.episode_length_buf * self.dt - self.last_command_time[...,0] >= 1.0
-        # rew[index] = torch.sum(torch.abs(self.dof_pos[index] - self.default_dof_pos), dim=1)
-        # return rew * (~self.is_vel[:, 0])
-        return torch.sum(torch.abs(self.dof_pos - self.default_dof_pos), dim=1) * (~self.is_vel[:, 0])
+        return torch.sum(torch.abs(self.dof_pos - self.default_dof_pos), dim=1) * (~self.is_vel[:, 0]) *(torch.norm(self.base_lin_vel[:,],dim=1))
 
     # def _reward_deviation_knee_joint(self):
     #     # height_error = (self.root_states[:, 2] - self.commands[:, 4])

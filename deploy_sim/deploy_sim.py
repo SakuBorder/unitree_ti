@@ -74,7 +74,7 @@ if __name__ == "__main__":
     dof_pos_scale = 1.0
     dof_vel_scale = 0.05
     action_scale = 0.12
-    cmd_scale = np.array([2.0,2.0,0.5], dtype=np.float32)
+    cmd_scale = np.array([2.0,2.0,1.0], dtype=np.float32)
 
     num_actions = 12
     num_obs = 47
@@ -213,12 +213,12 @@ if __name__ == "__main__":
             # sim_counter += 1
             if sim_counter % control_decimation == 0:
                 # print(sim_counter)
-                # if sim_counter>2000 and sim_counter<3000:
-                #     cmd = np.array([0.9,0.0,0.0], dtype=np.float32)
-                # elif sim_counter>3000 and sim_counter<5000:
+                # if sim_counter>250 and sim_counter<500:
+                #     cmd = np.array([1.0,0.0,0.0], dtype=np.float32)
+                # elif sim_counter>500 and sim_counter<750:
                 #     cmd = np.array([0.0,0.0,0.0], dtype=np.float32)
-                # elif sim_counter>5000:
-                #     cmd = np.array([0.0,0.0,0.0], dtype=np.float32)
+                # elif sim_counter>750:
+                #     cmd = np.array([1.0,0.0,0.0], dtype=np.float32)
 
                 control_counter += 1
                 # Apply control signal here.
