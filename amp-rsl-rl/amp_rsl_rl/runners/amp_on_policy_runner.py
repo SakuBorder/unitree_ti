@@ -107,12 +107,11 @@ class AMPOnPolicyRunner:
         self.discriminator_cfg = dict(train_cfg.get("discriminator", {}))
         self.amp_cfg = _merge_amp_cfg(train_cfg)
 
-        # === 新增：读取奖励融合权重（默认 0.5/0.5，并归一化到和为 1） ===
+        # === 奖励融合权重（默认 0.5/0.5，并归一化到和为 1） ===
         self.task_w = float(self.amp_cfg.get("task_weight", 0.5))
         self.style_w = float(self.amp_cfg.get("style_weight", 0.5))
         _sum_w = self.task_w + self.style_w
         if _sum_w <= 0.0:
-            # 兜底，避免除零或负权
             self.task_w, self.style_w = 0.5, 0.5
         else:
             self.task_w /= _sum_w
@@ -176,6 +175,49 @@ class AMPOnPolicyRunner:
             slow_down_factor,
             joint_names,
         )
+
+        # === AMP 数据摘要（打印 + 存起来，稍后写入 TensorBoard） ===
+        self.amp_data = amp_data  # 以备需要时访问
+
+        def _get_attr_any(obj, names):
+            for name in names:
+                v = getattr(obj, name, None)
+                if v is not None:
+                    return v
+            return None
+
+        # 尝试拿到样本/转移数量（不同实现字段名可能不同）
+        num_pairs = _get_attr_any(amp_data, ["num_pairs", "num_samples", "size", "N", "length"])
+        if num_pairs is None:
+            try:
+                num_pairs = len(amp_data)
+            except Exception:
+                num_pairs = "unknown"
+
+        # 数据集+权重的稳健拼接
+        _ds = dataset_names or []
+        _ws = dataset_weights or []
+        if _ws and len(_ws) != len(_ds):
+            _ws = _ws[:len(_ds)] + [1.0] * max(0, len(_ds) - len(_ws))
+        if not _ws:
+            _ws = [1.0] * len(_ds)
+
+        datasets_line = ", ".join([f"{n}(w={w})" for n, w in zip(_ds, _ws)])
+        pairs_txt = f"{num_pairs}" if isinstance(num_pairs, (int, float)) else str(num_pairs)
+
+        self._amp_data_text = (
+            f"path: {amp_data_path}\n"
+            f"datasets: {datasets_line if datasets_line else '<none>'}\n"
+            f"delta_t={delta_t:.6f}, decimation={decimation}, slow_down_factor={slow_down_factor}\n"
+            f"num_amp_obs={num_amp_obs}, disc_input_dim={num_amp_obs * 2}\n"
+            f"estimated_pairs={pairs_txt}"
+        )
+
+        print("[AMP DATA] ==== Expert dataset summary ====")
+        for line in self._amp_data_text.splitlines():
+            print("[AMP DATA] " + line)
+        print("[AMP DATA] =================================")
+
         self.amp_normalizer = Normalizer(num_amp_obs, device=self.device)
         self.discriminator = Discriminator(
             input_dim=num_amp_obs * 2,  # current + next
@@ -238,6 +280,7 @@ class AMPOnPolicyRunner:
         self.git_status_repos = [rsl_rl.__file__]
 
 
+
     # ----------------- 训练循环 -----------------
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
@@ -274,6 +317,10 @@ class AMPOnPolicyRunner:
         if hasattr(self.discriminator, "input_dim"):
             print(f"[AMP DEBUG] Discriminator input_dim={self.discriminator.input_dim} (should be 2*{num_amp_obs})")
 
+        # 将 AMP 数据摘要写入 TensorBoard（只写一次，global_step=0）
+        if self.writer is not None and getattr(self, "_amp_data_text", None):
+            self.writer.add_text("AMP/DataSummary", f"<pre>{self._amp_data_text}</pre>", 0)
+
         for it in range(start_iter, tot_iter):
             start = time.time()
             mean_style_reward_log = 0.0
@@ -306,11 +353,11 @@ class AMPOnPolicyRunner:
                     # 判别器风格奖励
                     style_rewards = self.discriminator.predict_reward(amp_obs, next_amp_obs, normalizer=self.amp_normalizer)
 
-                    # 记录原始任务/风格奖励均值（仅用于日志）
+                    # 原始任务/风格奖励均值（日志用）
                     mean_task_reward_log += rewards.mean().item()
                     mean_style_reward_log += style_rewards.mean().item()
 
-                    # === 关键修改：使用配置权重进行融合 ===
+                    # === 使用配置权重进行融合 ===
                     rewards = self.task_w * rewards + self.style_w * style_rewards
 
                     # 存入算法缓存
@@ -432,6 +479,7 @@ class AMPOnPolicyRunner:
         if self.log_dir is not None:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"), save_onnx=True)
 
+
     # ----------------- 日志/工具/保存 -----------------
 
     def _build_amp_obs_from_obs(self, obs: torch.Tensor, num_amp_obs: int) -> torch.Tensor:
@@ -529,6 +577,7 @@ class AMPOnPolicyRunner:
         if len(locs["rewbuffer"]) > 0:
             self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
             self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
+            # 这里记录原始任务/风格奖励的“本迭代均值”（注意：是逐步累加的均值，而非融合后的总奖励）
             self.writer.add_scalar("Train/mean_style_reward", locs["mean_style_reward_log"], locs["it"])
             self.writer.add_scalar("Train/mean_task_reward", locs["mean_task_reward_log"], locs["it"])
 
@@ -573,6 +622,7 @@ class AMPOnPolicyRunner:
             f"""{'ETA:':>{pad}} {int(eta_h)}h {int(eta_m)}m {int(eta_s)}s\n"""
         )
         print(log_string)
+
 
 
     def save(self, path, infos=None, save_onnx=False):

@@ -1,5 +1,5 @@
 amass_root: /home/dy/dy/code/unitree_ti/amp_datasets/npz
-fit_all: false
+fit_all: true
 fitting_iterations: 500
 robot:
   humanoid_type: ti512

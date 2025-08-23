@@ -1,7 +1,7 @@
 # 修复：改为使用AMASS数据
 # pkl_root: /home/dy/dy/code/unitree_ti/amp-rsl-rl/amp_datasets/pkl
 amass_root: /home/dy/dy/code/unitree_ti/amp_datasets/npz  # 替换为你的AMASS数据路径
-fit_all: false  # 修复：先测试单个文件，成功后再改为true
+fit_all: true  # 修复：先测试单个文件，成功后再改为true
 fitting_iterations: 500
 # motion_name 对AMASS数据无效，移除或注释
 # motion_name: "0-Male2Walking_c3d_B15 -  Walk turn around_poses"

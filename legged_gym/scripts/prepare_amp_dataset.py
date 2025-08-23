@@ -23,7 +23,7 @@ def prepare_tiv2_amp_data():
     ]
     
     # 转换所有motion文件
-    motion_dir = Path("data/tiv2/v1/singles")
+    motion_dir = Path("/home/dy/dy/code/unitree_ti/data/ti512/v1/singles")
     output_dir = Path("/home/dy/dy/code/unitree_ti/amp_datasets/npy")
     output_dir.mkdir(parents=True, exist_ok=True)
     

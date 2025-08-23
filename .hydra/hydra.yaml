@@ -113,7 +113,7 @@ hydra:
     - hydra.mode=RUN
     task: []
   job:
-    name: vis_q_mj_taihu
+    name: retarget_pkl
     chdir: null
     override_dirname: ''
     id: ???
