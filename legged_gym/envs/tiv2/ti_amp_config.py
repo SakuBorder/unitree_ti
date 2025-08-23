@@ -112,11 +112,11 @@ class TiV2AMPCfg(LeggedRobotCfg):
             lin_acc = -2.5e-5
             contact_momentum = 2.5e-2
 
-    # AMP特定配置
+    # AMP特定配置 - 统一使用正确路径
     class amp:
-        amp_data_path = "/home/dy/dy/code/unitree_ti/amp-rsl-rl/amp_datasets/pkl"
-        dataset_names = ["0-Male2Walking_c3d_B15 -  Walk turn around_poses"]
-        dataset_weights = [1.0]  # 修正：只有一个数据集，权重应该是[1.0]
+        amp_data_path = "/home/dy/dy/code/unitree_ti/data/ti512/v1/singles"
+        dataset_names = ["0-Male2Walking_c3d_B9 -  Walk turn left 90_poses"]
+        dataset_weights = [1.0]
         slow_down_factor = 1
         num_amp_obs = 30  # 与env.num_amp_obs保持一致
         dt = 1.0/60.0  # simulation timestep
@@ -184,11 +184,11 @@ class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
         eta_wgan = 0.3  # 如果使用Wasserstein loss
         reward_clamp_epsilon = 1e-4
 
-    # AMP特定配置（复制到training config中）
+    # AMP特定配置 - 与环境配置保持一致
     class amp:
         amp_data_path = "/home/dy/dy/code/unitree_ti/data/ti512/v1/singles"
         dataset_names = ["0-Male2Walking_c3d_B9 -  Walk turn left 90_poses"]
-        dataset_weights = [1.0]  # 修正权重
+        dataset_weights = [1.0]
         slow_down_factor = 1
         num_amp_obs = 30
         dt = 1.0/60.0

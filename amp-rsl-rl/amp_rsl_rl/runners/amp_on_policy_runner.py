@@ -92,7 +92,7 @@ def _merge_amp_cfg(train_cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 class AMPOnPolicyRunner:
     """
-    AMP + PPO 训练器（兼容你当前 BaseTask 风格接口）
+    AMP + PPO 训练器（仅 TensorBoard，KISS 版）
     """
 
     def __init__(self, env: VecEnv, train_cfg, log_dir=None, device="cpu"):
@@ -106,7 +106,6 @@ class AMPOnPolicyRunner:
         self.alg_cfg = dict(train_cfg.get("algorithm", {}))
         self.discriminator_cfg = dict(train_cfg.get("discriminator", {}))
         self.amp_cfg = _merge_amp_cfg(train_cfg)
-        self.logger_type = self.cfg.get("logger", "tensorboard").lower()
 
         # -------- 获取一帧观测维度 --------
         obs0, priv0 = _unpack_env_observations(self.env)
@@ -216,9 +215,12 @@ class AMPOnPolicyRunner:
             [num_actions],
         )
 
-        # 日志
+        # 日志（仅 TensorBoard）
         self.log_dir = log_dir
-        self.writer = None
+        self.writer: Optional[TensorboardSummaryWriter] = None
+        if self.log_dir is not None:
+            self.writer = TensorboardSummaryWriter(log_dir=self.log_dir, flush_secs=10)
+
         self.tot_timesteps = 0
         self.tot_time = 0
         self.current_learning_iteration = 0
@@ -227,40 +229,6 @@ class AMPOnPolicyRunner:
     # ----------------- 训练循环 -----------------
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
-        # 初始化 writer
-        if self.log_dir is not None and self.writer is None:
-            if self.logger_type == "neptune":
-                from rsl_rl.utils.neptune_utils import NeptuneSummaryWriter
-                self.writer = NeptuneSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
-                self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
-            elif self.logger_type == "wandb":
-                from rsl_rl.utils.wandb_utils import WandbSummaryWriter
-                import wandb
-                self.writer = WandbSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
-                # 可选：自动编号
-                def update_run_name_with_sequence(prefix: str) -> None:
-                    project = wandb.run.project
-                    entity = wandb.run.entity
-                    api = wandb.Api()
-                    runs = api.runs(f"{entity}/{project}")
-                    max_num = 0
-                    for run in runs:
-                        if run.name.startswith(prefix):
-                            numeric_suffix = run.name[len(prefix):]
-                            try:
-                                run_num = int(numeric_suffix)
-                                max_num = max(max_num, run_num)
-                            except ValueError:
-                                continue
-                    wandb.run.name = f"{prefix}{max_num + 1}"
-                    print("Updated run name to:", wandb.run.name)
-                if "wandb_project" in self.cfg:
-                    update_run_name_with_sequence(prefix=self.cfg["wandb_project"])
-                wandb.gym.monitor()
-                self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
-            else:
-                self.writer = TensorboardSummaryWriter(log_dir=self.log_dir, flush_secs=10)
-
         # 随机化 episode 起点
         if init_at_random_ep_len and hasattr(self.env, "episode_length_buf") and hasattr(self.env, "max_episode_length"):
             self.env.episode_length_buf = torch.randint_like(self.env.episode_length_buf, high=int(self.env.max_episode_length))
@@ -273,6 +241,7 @@ class AMPOnPolicyRunner:
         num_amp_obs = int(self.amp_cfg.get("num_amp_obs", obs.shape[-1]))
         amp_obs = self._build_amp_obs_from_obs(obs, num_amp_obs)
 
+        # 归一化/设备
         obs = self.obs_normalizer(obs).to(self.device)
         critic_obs = self.critic_obs_normalizer(critic_obs).to(self.device)
         amp_obs = amp_obs.to(self.device)
@@ -287,6 +256,11 @@ class AMPOnPolicyRunner:
 
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
+
+        # [AMP DEBUG] 一次性 sanity 打印（第一个 iteration 之前）
+        print(f"[AMP DEBUG] Shapes | actor_obs={tuple(obs.shape)}, critic_obs={tuple(critic_obs.shape)}, amp_obs={tuple(amp_obs.shape)}")
+        if hasattr(self.discriminator, "input_dim"):
+            print(f"[AMP DEBUG] Discriminator input_dim={self.discriminator.input_dim} (should be 2*{num_amp_obs})")
 
         for it in range(start_iter, tot_iter):
             start = time.time()
@@ -343,8 +317,8 @@ class AMPOnPolicyRunner:
                     critic_obs = critic_next
                     amp_obs = torch.clone(next_amp_obs)
 
-                    # 训练日志
-                    if self.log_dir is not None:
+                    # 训练日志（episode）
+                    if self.writer is not None:
                         if isinstance(infos, dict) and "episode" in infos:
                             ep_infos.append(infos["episode"])
                         cur_reward_sum += rewards
@@ -364,7 +338,6 @@ class AMPOnPolicyRunner:
                 self.alg.compute_returns(critic_obs)
 
             # --- Update step（返回值长度自适应） ---
-            
             update_out = self.alg.update()
             if not isinstance(update_out, (list, tuple)):
                 raise RuntimeError(f"Unexpected update() return type: {type(update_out)}")
@@ -406,9 +379,22 @@ class AMPOnPolicyRunner:
             learn_time = stop - start
             self.current_learning_iteration = it
 
-            # 记录
-            if self.log_dir is not None:
-                # 额外把 swap/symmetry 指标放入 locals 参与 log()
+            # [AMP DEBUG] 每次迭代打印（前 3 次必打，之后每 100 次打一次）
+            steps_this_iter = float(self.num_steps_per_env)
+            mean_style_reward_avg = mean_style_reward_log / max(1.0, steps_this_iter)
+            if (it < start_iter + 3) or (it % 100 == 0):
+                print(
+                    f"[AMP DEBUG] it={it} | amp_loss={mean_amp_loss:.4f} "
+                    f"| grad_pen={mean_grad_pen_loss:.4f} "
+                    f"| policy_pred≈{mean_policy_pred:.3f} "
+                    f"| expert_pred≈{mean_expert_pred:.3f} "
+                    f"| acc_pol={mean_accuracy_policy:.3f} "
+                    f"| acc_exp={mean_accuracy_expert:.3f} "
+                    f"| style_reward(avg/step)={mean_style_reward_avg:.4f}"
+                )
+
+            # 记录到 TensorBoard & 终端
+            if self.writer is not None:
                 locals_to_log = locals().copy()
                 locals_to_log.update({
                     "mean_swap_loss": mean_swap_loss,
@@ -417,18 +403,15 @@ class AMPOnPolicyRunner:
                 })
                 self.log(locals_to_log)
 
-            # 保存
+            # 定期保存
             if self.log_dir is not None and (it % self.save_interval == 0):
                 self.save(os.path.join(self.log_dir, f"model_{it}.pt"), save_onnx=True)
 
             ep_infos.clear()
             if it == start_iter and self.log_dir is not None:
-                # 记录代码状态
+                # 记录代码状态（失败则忽略）
                 try:
-                    git_file_paths = store_code_state(self.log_dir, [rsl_rl.__file__])
-                    if self.logger_type in ["wandb", "neptune"] and git_file_paths:
-                        for path in git_file_paths:
-                            self.writer.save_file(path)
+                    store_code_state(self.log_dir, [rsl_rl.__file__])
                 except Exception:
                     pass
 
@@ -440,19 +423,49 @@ class AMPOnPolicyRunner:
 
     def _build_amp_obs_from_obs(self, obs: torch.Tensor, num_amp_obs: int) -> torch.Tensor:
         """
-        从 obs 构造 AMP 判别器输入：
-          - 默认取前 num_amp_obs 维；若维度不足则直接返回 obs
-        如你在 env 侧已有更精准的 AMP 特征，可在此替换为拼接的特征张量。
+        正确构建AMP观测 - 优先使用环境提供的专用方法
         """
+        # 方法1: 优先使用环境的compute_amp_observations方法
+        if hasattr(self.env, 'compute_amp_observations'):
+            return self.env.compute_amp_observations()
+
+        # 方法2: 从环境状态重新构造（如果环境没有专用方法）
+        try:
+            from isaacgym.torch_utils import quat_rotate_inverse
+
+            # 确保环境有必要的属性
+            if hasattr(self.env, 'dof_pos') and hasattr(self.env, 'dof_vel') and hasattr(self.env, 'base_quat') and hasattr(self.env, 'root_states'):
+                base_lin_vel_local = quat_rotate_inverse(self.env.base_quat, self.env.root_states[:, 7:10])
+                base_ang_vel_local = quat_rotate_inverse(self.env.base_quat, self.env.root_states[:, 10:13])
+
+                amp_obs = torch.cat([
+                    self.env.dof_pos,      # 关节位置 (12)
+                    self.env.dof_vel,      # 关节速度 (12)
+                    base_lin_vel_local,    # 局部线速度 (3)
+                    base_ang_vel_local,    # 局部角速度 (3)
+                ], dim=-1)
+
+                return amp_obs
+            else:
+                print("Warning: Environment missing required attributes for AMP observation construction")
+
+        except Exception as e:
+            print(f"Warning: Failed to construct AMP observations from environment state: {e}")
+
+        # 方法3: 回退（截断/填充），打印警告
+        print(f"Warning: Using fallback AMP observation (simple truncation). This may not be correct!")
+        print(f"Expected AMP obs dim: {num_amp_obs}, got obs shape: {obs.shape}")
         if obs.shape[-1] >= num_amp_obs:
             return obs[..., :num_amp_obs]
         return obs
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):
+        # 统计
         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
         self.tot_time += locs["collection_time"] + locs["learn_time"]
         iteration_time = locs["collection_time"] + locs["learn_time"]
 
+        # Episode 标量写 TensorBoard，同时拼装 ep_string
         ep_string = ""
         if locs["ep_infos"]:
             for key in locs["ep_infos"][0]:
@@ -473,12 +486,14 @@ class AMPOnPolicyRunner:
                     self.writer.add_scalar("Episode/" + key, value, locs["it"])
                     ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
 
+        # 其它标量
         try:
             mean_std = float(self.alg.actor_critic.std.mean().item())
         except Exception:
             mean_std = float("nan")
         fps = int(self.num_steps_per_env * self.env.num_envs / (locs["collection_time"] + locs["learn_time"]))
 
+        # 写 TensorBoard（包含 AMP）
         self.writer.add_scalar("Loss/value_function", locs["mean_value_loss"], locs["it"])
         self.writer.add_scalar("Loss/surrogate", locs["mean_surrogate_loss"], locs["it"])
         self.writer.add_scalar("Loss/amp_loss", locs["mean_amp_loss"], locs["it"])
@@ -489,7 +504,6 @@ class AMPOnPolicyRunner:
         self.writer.add_scalar("Loss/accuracy_expert", locs["mean_accuracy_expert"], locs["it"])
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
         self.writer.add_scalar("Loss/mean_kl_divergence", locs["mean_kl_divergence"], locs["it"])
-        # 可选：兼容 HIMPPO 的对称性/交换损失（若没有则为 0）
         self.writer.add_scalar("Loss/Swap Loss", locs.get("mean_swap_loss", 0.0), locs["it"])
         self.writer.add_scalar("Loss/Actor Sym Loss", locs.get("mean_actor_sym_loss", 0.0), locs["it"])
         self.writer.add_scalar("Loss/Critic Sym Loss", locs.get("mean_critic_sym_loss", 0.0), locs["it"])
@@ -505,31 +519,36 @@ class AMPOnPolicyRunner:
             self.writer.add_scalar("Train/mean_style_reward", locs["mean_style_reward_log"], locs["it"])
             self.writer.add_scalar("Train/mean_task_reward", locs["mean_task_reward_log"], locs["it"])
 
-        # 终端打印
+        # ---- 终端块打印（加入 AMP 行）----
         head = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
+        # AMP 的“每步风格奖励均值”，便于跟踪是否稳定>0
+        steps_this_iter = float(self.num_steps_per_env)
+        mean_style_reward_avg = locs["mean_style_reward_log"] / max(1.0, steps_this_iter)
+
+        common = (
+            f"""{'#' * width}\n"""
+            f"""{head.center(width, ' ')}\n\n"""
+            f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs['collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
+            f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
+            f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
+            f"""{'AMP loss:':>{pad}} {locs['mean_amp_loss']:.4f}\n"""
+            f"""{'Grad penalty:':>{pad}} {locs['mean_grad_pen_loss']:.4f}\n"""
+            f"""{'Disc policy_pred (~P(policy)):':>{pad}} {locs['mean_policy_pred']:.4f}\n"""
+            f"""{'Disc expert_pred (~P(expert)):':>{pad}} {locs['mean_expert_pred']:.4f}\n"""
+            f"""{'Disc acc(policy/expert):':>{pad}} {locs['mean_accuracy_policy']:.3f} / {locs['mean_accuracy_expert']:.3f}\n"""
+            f"""{'Style reward (avg/step):':>{pad}} {mean_style_reward_avg:.4f}\n"""
+            f"""{'Mean action noise std:':>{pad}} {mean_std:.2f}\n"""
+        )
+
         if len(locs["rewbuffer"]) > 0:
-            log_string = (
-                f"""{'#' * width}\n"""
-                f"""{head.center(width, ' ')}\n\n"""
-                f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs['collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
-                f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
-                f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
-                f"""{'Mean action noise std:':>{pad}} {mean_std:.2f}\n"""
+            common += (
                 f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
                 f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
             )
-        else:
-            log_string = (
-                f"""{'#' * width}\n"""
-                f"""{head.center(width, ' ')}\n\n"""
-                f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs['collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
-                f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
-                f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
-                f"""{'Mean action noise std:':>{pad}} {mean_std:.2f}\n"""
-            )
-        log_string += ep_string
 
-        # ETA 打印（友好格式）
+        log_string = common + ep_string
+
+        # ETA
         eta_seconds = self.tot_time / (locs["it"] + 1) * (locs["num_learning_iterations"] - locs["it"])
         eta_h, rem = divmod(eta_seconds, 3600)
         eta_m, eta_s = divmod(rem, 60)
@@ -541,6 +560,7 @@ class AMPOnPolicyRunner:
             f"""{'ETA:':>{pad}} {int(eta_h)}h {int(eta_m)}m {int(eta_s)}s\n"""
         )
         print(log_string)
+
 
     def save(self, path, infos=None, save_onnx=False):
         saved_dict = {
@@ -556,9 +576,6 @@ class AMPOnPolicyRunner:
             saved_dict["critic_obs_norm_state_dict"] = getattr(self, "critic_obs_normalizer").state_dict()
         torch.save(saved_dict, path)
 
-        if self.logger_type in ["neptune", "wandb"]:
-            self.writer.save_model(path, self.current_learning_iteration)
-
         if save_onnx:
             onnx_folder = os.path.dirname(path)
             iteration = int(os.path.basename(path).split("_")[1].split(".")[0])
@@ -569,8 +586,6 @@ class AMPOnPolicyRunner:
                 path=onnx_folder,
                 filename=onnx_model_name,
             )
-            if self.logger_type in ["neptune", "wandb"]:
-                self.writer.save_model(os.path.join(onnx_folder, onnx_model_name), self.current_learning_iteration)
 
     def load(self, path, load_optimizer=True, weights_only=False):
         loaded_dict = torch.load(path, map_location=self.device, weights_only=weights_only)

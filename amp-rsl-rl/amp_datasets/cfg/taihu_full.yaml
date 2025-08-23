@@ -1,11 +1,13 @@
 # =========================
 #   Data / Run Settings
 # =========================
-pkl_root: /home/dy/dy/code/unitree_ti/amp-rsl-rl/amp_datasets/pkl
-# amass_root: /path/to/amass_npz
-fit_all: true
+# 修复：改为使用 AMASS 数据
+amass_root: /home/dy/dy/code/unitree_ti/amp_datasets/npz  # 替换为你的 AMASS npz 路径
+fit_all: false                 # 先单文件验证成功后再改 true
 fitting_iterations: 500
-motion_name: 0-Male2Walking_c3d_B15 -  Walk turn around_poses
+# motion_name 对 AMASS 数据无效，移除或注释
+# motion_name: 0-Male2Walking_c3d_B15 -  Walk turn around_poses
+
 hydra:
   run:
     dir: .
@@ -15,29 +17,14 @@ hydra:
 # =========================
 robot:
   humanoid_type: taihu
-  bias_offset: false
-  has_self_collision: true
-  has_mesh: false
-  has_jt_limit: false
-  has_dof_subset: true
-  has_upright_start: true
-  has_smpl_pd_offset: false
-  remove_toe: false         # For humanoid's geom toe
-  motion_sym_loss: false
-  sym_loss_coef: 1
-  big_ankle: true
 
-  has_shape_obs: true
-  has_shape_obs_disc: false
-  has_shape_variation: false
+  # 资产与文件
+  asset:
+    assetRoot: "/home/dy/dy/code/unitree_ti/assert/ti5/"
+    assetFileName: "/home/dy/dy/code/unitree_ti/assert/ti5/ti_no_limit.xml"
+    urdfFileName: "tai5_12dof_no_limit.urdf"
 
-  masterfoot: false
-  freeze_toe: false
-  freeze_hand: false
-  box_body: true
-  real_weight: true
-  real_weight_porpotion_capsules: true
-  real_weight_porpotion_boxes: true
+  base_link: "WAIST_Y_S"
 
   body_names:
     - pelvis
@@ -72,13 +59,8 @@ robot:
     - R_WRIST_Y_S
     - R_WRIST_R_S
 
-  limb_weight_group:
-    - ['L_HIP_P_S', 'L_HIP_R_S', 'L_HIP_Y_S', 'L_KNEE_P_S', 'L_ANKLE_P_S', 'L_ANKLE_R_S']
-    - ['R_HIP_P_S', 'R_HIP_R_S', 'R_HIP_Y_S', 'R_KNEE_P_S', 'R_ANKLE_P_S', 'R_ANKLE_R_S']
-    - ['pelvis', 'NECK_Y_S']
-    - ['L_SHOULDER_P_S', 'L_SHOULDER_R_S', 'L_SHOULDER_Y_S', 'L_ELBOW_Y_S', 'L_WRIST_P_S', 'L_WRIST_Y_S', 'L_WRIST_R_S']
-    - ['R_SHOULDER_P_S', 'R_SHOULDER_R_S', 'R_SHOULDER_Y_S', 'R_ELBOW_Y_S', 'R_WRIST_P_S', 'R_WRIST_Y_S', 'R_WRIST_R_S']
-
+  # 注意：若你的控制器只控 12 个下肢关节，请改成只列这 12 个。
+  # 这里保留你原先的全身 DOF 列表。
   dof_names:
     - pelvis
     - L_HIP_P_S
@@ -112,18 +94,17 @@ robot:
     - R_WRIST_Y_S
     - R_WRIST_R_S
 
-  right_foot_name: 'r_foot_roll'
-  left_foot_name: 'l_foot_roll'
+  right_foot_name: "r_foot_roll"
+  left_foot_name: "l_foot_roll"
 
-  asset:
-    assetRoot: "/home/dy/dy/code/unitree_ti/assert/ti5"
-    assetFileName: "/home/dy/dy/code/unitree_ti/assert/ti5/ti_no_limit.xml"
-    urdfFileName: "tai5_12dof_no_limit.urdf"
+  limb_weight_group:
+    - ['L_HIP_P_S', 'L_HIP_R_S', 'L_HIP_Y_S', 'L_KNEE_P_S', 'L_ANKLE_P_S', 'L_ANKLE_R_S']
+    - ['R_HIP_P_S', 'R_HIP_R_S', 'R_HIP_Y_S', 'R_KNEE_P_S', 'R_ANKLE_P_S', 'R_ANKLE_R_S']
+    - ['pelvis', 'NECK_Y_S']
+    - ['L_SHOULDER_P_S', 'L_SHOULDER_R_S', 'L_SHOULDER_Y_S', 'L_ELBOW_Y_S', 'L_WRIST_P_S', 'L_WRIST_Y_S', 'L_WRIST_R_S']
+    - ['R_SHOULDER_P_S', 'R_SHOULDER_R_S', 'R_SHOULDER_Y_S', 'R_ELBOW_Y_S', 'R_WRIST_P_S', 'R_WRIST_Y_S', 'R_WRIST_R_S']
 
-  base_link: "WAIST_Y_S"
-
-  # 左侧：你的机器人 body_names_augment 中的名称
-  # 右侧：SMPL_BONE_ORDER_NAMES 中的名称
+  # 左侧：机器人关节/连杆；右侧：SMPL 名称
   joint_matches:
     - ['head_link', 'Head']
     - ['pelvis', 'Pelvis']
@@ -140,30 +121,59 @@ robot:
     - ['R_ELBOW_Y_S', 'R_Elbow']
     - ['R_WRIST_R_S', 'R_Wrist']
     - ['NECK_Y_S', 'Neck']
-    # - ["left_toe_link", "L_Toe"]
-    # - ["right_toe_link", "R_Toe"]
+    # - ['left_toe_link', 'L_Toe']
+    # - ['right_toe_link', 'R_Toe']
 
   extend_config:
     - joint_name: "head_link"
       parent_name: "pelvis"
       pos: [0.0, 0.0, 0.4]
       rot: [1.0, 0.0, 0.0, 0.0]
-
     - joint_name: "left_toe_link"
       parent_name: "L_ANKLE_R_S"
       pos: [0.08, 0.0, 0.0]
       rot: [1.0, 0.0, 0.0, 0.0]
-
     - joint_name: "right_toe_link"
       parent_name: "R_ANKLE_R_S"
       pos: [0.08, 0.0, 0.0]
       rot: [1.0, 0.0, 0.0, 0.0]
 
+  # 模型/几何相关开关（保持在 robot 段内）
+  has_self_collision: true
+  has_mesh: false
+  has_jt_limit: false
+  has_dof_subset: true
+  has_upright_start: true
+  remove_toe: false
+  big_ankle: true
+
+  masterfoot: false
+  freeze_toe: false
+  freeze_hand: false
+  box_body: true
+  real_weight: true
+  real_weight_porpotion_capsules: true
+  real_weight_porpotion_boxes: true
+
+  # SMPL 姿态修正器
   smpl_pose_modifier:
     - Pelvis: "[np.pi/2, 0, np.pi/2]"
-smpl_model_path: /home/dy/dy/code/unitree_ti/data/smpl   # 或你的SMPL模型绝对路径
-do_shape_fit: true                  # 首次生成 shape_optimized_v1.pkl
-shape_fit_force_refit: false        # 已存在则不重算；设 true 可强制重算
+
+# ========= 其余（保持顶层，与 12DOF 版本一致） =========
+bias_offset: false
+has_smpl_pd_offset: false
+motion_sym_loss: false
+sym_loss_coef: 1
+
+has_shape_obs: true
+has_shape_obs_disc: false
+has_shape_variation: false
+
+smpl_model_path: /home/dy/dy/code/unitree_ti/data/smpl
+
+# 形状拟合配置
+do_shape_fit: true
+shape_fit_force_refit: false
 shape_fit_iters: 2000
 shape_fit_lr: 0.1
-shape_fit_device: cpu               # 或 cuda
+shape_fit_device: cpu

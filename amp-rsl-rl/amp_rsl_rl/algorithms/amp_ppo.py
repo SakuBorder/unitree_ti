@@ -25,9 +25,10 @@ class AMP_PPO:
     """
     AMP_PPO implements Adversarial Motion Prior (AMP) combined with Proximal Policy Optimization (PPO).
 
-    This class integrates reinforcement learning via PPO with adversarial imitation learning using AMP.
-    It improves policy training by leveraging both interactions with the environment and expert motion data.
-    The discriminator is used to force the policy's behavior to align with expert demonstrations.
+    与版本A功能保持一致：
+    - 判别器损失：手动 BCE (expert=1, policy=0) + compute_grad_pen(expert-only)
+    - 与版本A相同的 KL 自适应学习率数值形式
+    - update() 返回 8 项统计
     """
 
     actor_critic: ActorCritic
@@ -74,7 +75,7 @@ class AMP_PPO:
         self.actor_critic = actor_critic.to(self.device)
         self.storage: Optional[RolloutStorage] = None
 
-        # Optimizer (share one for AC + Discriminator, with trunk/head不同的wd)
+        # Optimizer (share one for AC + Discriminator, trunk/head 不同的 wd)
         params = [
             {"params": self.actor_critic.parameters(), "name": "actor_critic"},
             {"params": self.discriminator.trunk.parameters(), "weight_decay": 1.0e-3, "name": "amp_trunk"},
@@ -95,6 +96,9 @@ class AMP_PPO:
         self.use_clipped_value_loss: bool = use_clipped_value_loss
         self.use_smooth_ratio_clipping: bool = use_smooth_ratio_clipping
 
+        # 与版本A一致：在 AMP_PPO 内部维护 BCEWithLogitsLoss
+        self.discriminator_loss = nn.BCEWithLogitsLoss()
+
     def init_storage(
         self,
         num_envs: int,
@@ -104,28 +108,23 @@ class AMP_PPO:
         action_shape: Tuple[int, ...],
     ) -> None:
         """
-        Initializes the storage for collected transitions during interactions with the environment.
-        兼容不同版本的 rsl_rl.storage.RolloutStorage 初始化签名。
+        初始化 RolloutStorage（兼容不同版本的参数名）。
         """
         candidate_kwargs = {
-            "training_type": "rl",  # 新版可能存在
+            "training_type": "rl",
             "num_envs": num_envs,
             "num_transitions_per_env": num_transitions_per_env,
             "obs_shape": actor_obs_shape,
-            "privileged_obs_shape": critic_obs_shape,  # 有的版本可能改名或不支持
+            "privileged_obs_shape": critic_obs_shape,
             "actions_shape": action_shape,
-            "rnd_state_shape": None,  # 新版可能存在
+            "rnd_state_shape": None,
             "device": self.device,
         }
-
         sig = inspect.signature(RolloutStorage.__init__)
         allowed = set(sig.parameters.keys()) - {"self"}
         final_kwargs = {k: v for k, v in candidate_kwargs.items() if k in allowed}
-
-        # 兼容别名：如果没有 privileged_obs_shape，但有 priv_obs_shape
         if "privileged_obs_shape" not in final_kwargs and "priv_obs_shape" in allowed:
             final_kwargs["priv_obs_shape"] = critic_obs_shape
-
         self.storage = RolloutStorage(**final_kwargs)
 
     def test_mode(self) -> None:
@@ -134,10 +133,18 @@ class AMP_PPO:
     def train_mode(self) -> None:
         self.actor_critic.train()
 
+    # === 与版本A一致的辅助函数 ===
+    def discriminator_policy_loss(self, discriminator_output: torch.Tensor) -> torch.Tensor:
+        expected = torch.zeros_like(discriminator_output, device=self.device)
+        return self.discriminator_loss(discriminator_output, expected)
+
+    def discriminator_expert_loss(self, discriminator_output: torch.Tensor) -> torch.Tensor:
+        expected = torch.ones_like(discriminator_output, device=self.device)
+        return self.discriminator_loss(discriminator_output, expected)
+
     def act(self, obs: torch.Tensor, critic_obs: torch.Tensor) -> torch.Tensor:
         """
-        Choose action and write transition fields.
-        关键：同时写 privileged_observations 与 critic_observations，兼容不同实现。
+        选择动作，并写入 transition（保持与版本A相同的使用方式）。
         """
         if getattr(self.actor_critic, "is_recurrent", False):
             self.transition.hidden_states = self.actor_critic.get_hidden_states()
@@ -151,25 +158,25 @@ class AMP_PPO:
         self.transition.action_sigma = self.actor_critic.action_std.detach()
 
         self.transition.observations = obs
+        # 同时写两个字段名以适配不同版本的存储实现
         self.transition.privileged_observations = critic_obs
-        self.transition.critic_observations = critic_obs  # 重要：你的 RolloutStorage 可能用这个字段名
+        self.transition.critic_observations = critic_obs
 
         return self.transition.actions
 
     def act_amp(self, amp_obs: torch.Tensor) -> None:
-        """Record AMP observation from policy side."""
+        """记录来自 policy 的 AMP 观测"""
         self.amp_transition.observations = amp_obs
 
     def process_env_step(
         self, rewards: torch.Tensor, dones: torch.Tensor, infos: Dict[str, Any]
     ) -> None:
         """
-        Add env step outcome to storage and reset RNN states for done envs.
+        写入奖励/终止，并在 time_outs 上进行 bootstrap（与版本A一致）。
         """
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
 
-        # bootstrapping on timeouts
         if isinstance(infos, dict) and "time_outs" in infos:
             self.transition.rewards += self.gamma * torch.squeeze(
                 self.transition.values * infos["time_outs"].unsqueeze(1).to(self.device),
@@ -182,35 +189,32 @@ class AMP_PPO:
 
     def process_amp_step(self, amp_obs: torch.Tensor) -> None:
         """
-        Insert (s_t, s_{t+1}) from policy into AMP replay buffer.
+        将 (s_t, s_{t+1}) 插入 AMP 回放缓存。
         """
         self.amp_storage.insert(self.amp_transition.observations, amp_obs)
         self.amp_transition.clear()
 
     def compute_returns(self, last_critic_obs: torch.Tensor) -> None:
         """
-        GAE returns based on critic(last_obs).
+        基于最后一个 critic 观测计算 GAE 回报（与版本A一致）。
         """
         last_values = self.actor_critic.evaluate(last_critic_obs).detach()
         self.storage.compute_returns(last_values, self.gamma, self.lam)
 
-    def update(self) -> Tuple[float, float, float, float, float, float, float, float, float]:
+    def update(self) -> Tuple[float, float, float, float, float, float, float, float]:
         """
-        Update both PPO and AMP discriminator.
-        自适应支持 11/12 项 mini-batch（是否含 rnd_state_batch 均可）。
-        返回 9 项统计（runner 按 9 项接收）。
+        同时更新 PPO 与 判别器。功能对齐版本A，返回 8 项统计。
         """
-        mean_value_loss = 0.0
-        mean_surrogate_loss = 0.0
-        mean_amp_loss = 0.0
-        mean_grad_pen_loss = 0.0
-        mean_policy_pred = 0.0
-        mean_expert_pred = 0.0
-        mean_accuracy_policy = 0.0
-        mean_accuracy_expert = 0.0
-        mean_accuracy_policy_elem = 0.0
-        mean_accuracy_expert_elem = 0.0
-        mean_kl_divergence = 0.0
+        mean_value_loss: float = 0.0
+        mean_surrogate_loss: float = 0.0
+        mean_amp_loss: float = 0.0
+        mean_grad_pen_loss: float = 0.0
+        mean_policy_pred: float = 0.0
+        mean_expert_pred: float = 0.0
+        mean_accuracy_policy: float = 0.0
+        mean_accuracy_expert: float = 0.0
+        mean_accuracy_policy_elem: float = 0.0
+        mean_accuracy_expert_elem: float = 0.0
 
         if getattr(self.actor_critic, "is_recurrent", False):
             generator = self.storage.reccurent_mini_batch_generator(
@@ -238,7 +242,7 @@ class AMP_PPO:
         for sample, sample_amp_policy, sample_amp_expert in zip(
             generator, amp_policy_generator, amp_expert_generator
         ):
-            # ---------- 自适应解包（11 或 12 项） ----------
+            # 自适应支持 11/12 项解包（等价但更稳健）
             if len(sample) == 12:
                 (
                     obs_batch,
@@ -272,7 +276,7 @@ class AMP_PPO:
             else:
                 raise RuntimeError(f"Unsupported minibatch sample length: {len(sample)}")
 
-            # ---------- PPO 前向 ----------
+            # === PPO 前向 ===
             self.actor_critic.act(
                 obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0]
             )
@@ -284,22 +288,20 @@ class AMP_PPO:
             sigma_batch = self.actor_critic.action_std
             entropy_batch = self.actor_critic.entropy
 
-            # ---------- KL 自适应 LR（可选） ----------
+            # === KL 自适应 LR（使用版本A的数值形式） ===
             if self.desired_kl is not None and self.schedule == "adaptive":
                 with torch.inference_mode():
                     kl = torch.sum(
-                        torch.log(sigma_batch / (old_sigma_batch + 1.0e-8) + 1.0e-5)
+                        torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
                         + (
                             torch.square(old_sigma_batch)
                             + torch.square(old_mu_batch - mu_batch)
                         )
-                        / (2.0 * torch.square(sigma_batch) + 1.0e-8)
+                        / (2.0 * torch.square(sigma_batch))
                         - 0.5,
                         dim=-1,
                     )
                     kl_mean = torch.mean(kl)
-                    mean_kl_divergence += kl_mean.item()
-
                     if kl_mean > self.desired_kl * 2.0:
                         self.learning_rate = max(1e-5, self.learning_rate / 1.5)
                     elif 0.0 < kl_mean < self.desired_kl / 2.0:
@@ -307,7 +309,7 @@ class AMP_PPO:
                     for g in self.optimizer.param_groups:
                         g["lr"] = self.learning_rate
 
-            # ---------- PPO 损失 ----------
+            # === PPO 损失 ===
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
             min_, max_ = 1.0 - self.clip_param, 1.0 + self.clip_param
             if self.use_smooth_ratio_clipping:
@@ -332,7 +334,7 @@ class AMP_PPO:
 
             ppo_loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
-            # ---------- AMP 判别器 ----------
+            # === AMP 判别器（与版本A同构） ===
             policy_state, policy_next_state = sample_amp_policy
             expert_state, expert_next_state = sample_amp_expert
 
@@ -340,10 +342,9 @@ class AMP_PPO:
                 with torch.no_grad():
                     policy_state = self.amp_normalizer.normalize(policy_state)
                     policy_next_state = self.amp_normalizer.normalize(policy_next_state)
-                    # import ipdb;ipdb.set_trace()
-
                     expert_state = self.amp_normalizer.normalize(expert_state)
                     expert_next_state = self.amp_normalizer.normalize(expert_next_state)
+
             B_pol = policy_state.size(0)
             discriminator_input = torch.cat(
                 (
@@ -355,21 +356,33 @@ class AMP_PPO:
             discriminator_output = self.discriminator(discriminator_input)
             policy_d, expert_d = discriminator_output[:B_pol], discriminator_output[B_pol:]
 
-            amp_loss, grad_pen_loss = self.discriminator.compute_loss(
-                policy_d, expert_d, sample_amp_expert, sample_amp_policy, lambda_=10
+            # 手动 BCE（与版本A保持一致）
+            expert_loss = self.discriminator_expert_loss(expert_d)
+            policy_loss = self.discriminator_policy_loss(policy_d)
+            amp_loss = 0.5 * (expert_loss + policy_loss)
+
+            # 仅对 expert 做 grad penalty（BCE 分支与版本A一致）
+            grad_pen_loss = self.discriminator.compute_grad_pen(
+                expert_states=(expert_state, expert_next_state),
+                policy_states=(policy_state, policy_next_state),  # BCE 路径中会被忽略
+                lambda_=10.0,
             )
 
+            # 总损失
             loss = ppo_loss + (amp_loss + grad_pen_loss)
 
+            # === 反传 & 更新 ===
             self.optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
 
+            # 归一化器更新
             if self.amp_normalizer is not None:
                 self.amp_normalizer.update(policy_state)
                 self.amp_normalizer.update(expert_state)
 
+            # 统计
             policy_d_prob = torch.sigmoid(policy_d)
             expert_d_prob = torch.sigmoid(expert_d)
 
@@ -400,10 +413,10 @@ class AMP_PPO:
             mean_accuracy_policy /= mean_accuracy_policy_elem
         if mean_accuracy_expert_elem > 0:
             mean_accuracy_expert /= mean_accuracy_expert_elem
-        mean_kl_divergence /= num_updates
 
         self.storage.clear()
 
+        # 与版本A一致：返回 8 项
         return (
             mean_value_loss,
             mean_surrogate_loss,
@@ -413,5 +426,4 @@ class AMP_PPO:
             mean_expert_pred,
             mean_accuracy_policy,
             mean_accuracy_expert,
-            mean_kl_divergence,
         )

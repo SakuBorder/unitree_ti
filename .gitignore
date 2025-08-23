@@ -21,3 +21,5 @@ dist/
 *.pkl
 *.npy
 *.pt
+*.npz
+*.onnx
