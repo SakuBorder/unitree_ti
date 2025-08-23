@@ -25,10 +25,14 @@ class TiV2AMPCfg(LeggedRobotCfg):
         num_actions = 12
         num_lower_dof = 12
 
-        # AMP 观测维度：12(q) + 12(dq) + 3(v_base_local) + 3(w_base_local) = 30
-        num_amp_obs = 30
+        # ===== 新增：AMP历史配置 =====
+        num_amp_obs_steps = 2  # AMP观测历史步数（默认2步）
+        
+        # AMP观测维度：(12+12+3+3) × 2步 = 60维
+        num_amp_obs_per_step = 30  # 单步AMP观测维度
+        num_amp_obs = num_amp_obs_steps * num_amp_obs_per_step  # 总AMP观测维度
 
-        # 与现有栈保持一致（actor=282, critic=50）
+        # 保持现有观测配置不变
         num_one_step_observations = 2 * 12 + 11 + 12  # 47
         num_one_step_privileged_obs = num_one_step_observations + 3  # 50
         num_actor_history = 6
@@ -145,11 +149,9 @@ class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
         actor_hidden_dims = [512, 256, 128]
         critic_hidden_dims = [512, 256, 128]
         activation = 'elu'
-        # 使用 MoE 时只保留必要字段，避免无效参数告警
         num_experts = 4
 
     class algorithm:
-        # 与 AMP_PPO.__init__ 对齐
         num_learning_epochs = 5
         num_mini_batches = 4
         clip_param = 0.2
@@ -172,20 +174,23 @@ class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
         eta_wgan = 0.3
         reward_clamp_epsilon = 1e-4
 
-    # ★ 唯一生效的 AMP 段：Runner 只读取这里的配置
+    # AMP配置
     class amp:
         amp_data_path = "/home/dy/dy/code/unitree_ti/data/ti512/v1/singles"
-        # 读取该目录下的所有专家文件（.pkl/.npy/.npz/.pt）
-        dataset_names = ["walk","maikan"]
-        dataset_weights = [0.2,0.8]
+        dataset_names = ["walk", "maikan"]
+        dataset_weights = [0.2, 0.8]
         slow_down_factor = 1
-        num_amp_obs = 30
+        
+        # ===== 更新：AMP观测配置 =====
+        num_amp_obs_steps = 2  # 历史步数
+        num_amp_obs = 60  # 30 × 2步
+        
         dt = 1.0/60.0
         decimation = 4
         replay_buffer_size = 100000
         reward_scale = 2.0
         joint_names = None
 
-        # 任务/风格融合权重（Runner 已支持）
+        # 任务/风格融合权重
         style_weight = 0.5
-        task_weight  = 0.5
+        task_weight = 0.5
