@@ -53,21 +53,11 @@ from amp_rsl_rl.utils.torch_humanoid_batch import Humanoid_Batch
 # --------------------------
 # I/O helpers
 # --------------------------
-def load_pkl_data(data_path):
-    """加载pkl文件数据"""
-    try:
-        data = joblib.load(data_path)
-        return data
-    except Exception as e:
-        print(f"Error loading {data_path}: {e}")
-        return None
-
-
 def load_amass_data(data_path):
     """加载 AMASS .npz 数据"""
     entry_data = dict(np.load(open(data_path, "rb"), allow_pickle=True))
     if "mocap_framerate" not in entry_data:
-        return
+        return None
     framerate = entry_data["mocap_framerate"]
 
     root_trans = entry_data["trans"]                         # (T, 3)
@@ -82,38 +72,6 @@ def load_amass_data(data_path):
         "betas": betas,
         "fps": framerate,
     }
-
-
-def extract_data_from_pkl(pkl_data):
-    """从pkl数据中提取需要的信息"""
-    if isinstance(pkl_data, dict):
-        motion_key = list(pkl_data.keys())[0]
-        motion_data = pkl_data[motion_key]
-
-        if "root_trans_offset" in motion_data:
-            trans = motion_data["root_trans_offset"]
-        elif "trans" in motion_data:
-            trans = motion_data["trans"]
-        else:
-            print("Warning: No translation data found in pkl")
-            return None
-
-        if "pose_aa" in motion_data:
-            pose_aa = motion_data["pose_aa"]
-        else:
-            print("Warning: No pose data found in pkl")
-            return None
-
-        fps = motion_data.get("fps", 30)
-        return {
-            "pose_aa": pose_aa,
-            "trans": trans,
-            "fps": fps,
-            "motion_key": motion_key,
-        }
-    else:
-        print("Warning: Unexpected pkl data format")
-        return None
 
 
 # --------------------------
@@ -148,7 +106,7 @@ def fit_shape_and_scale(
 
     robot_joint_pick_idx, smpl_joint_pick_idx = _build_robot_smpl_correspondence(humanoid_fk, cfg)
 
-    # 机器人“零姿态”的AA（只用到骨架位置）
+    # 机器人"零姿态"的AA（只用到骨架位置）
     pose_aa_robot = np.repeat(
         np.repeat(sRot.identity().as_rotvec()[None, None, None,], humanoid_fk.num_bodies, axis=2),
         1,
@@ -211,6 +169,10 @@ def fit_shape_and_scale(
             save_dir = f"data/{cfg.robot.humanoid_type}"
             os.makedirs(save_dir, exist_ok=True)
             save_path = osp.join(save_dir, "shape_optimized_v1.pkl")
+        else:
+            save_dir = osp.dirname(save_path)
+            os.makedirs(save_dir, exist_ok=True)
+            
         joblib.dump((shape_new.detach().cpu(), scale.detach().cpu()), save_path)
         print(f"[ShapeFit] saved to {save_path}")
 
@@ -252,7 +214,9 @@ def ensure_shape_file(
     返回: (shape_new[1,10], scale[1])
     """
     save_dir = f"data/{cfg.robot.humanoid_type}"
+    os.makedirs(save_dir, exist_ok=True)
     save_path = osp.join(save_dir, "shape_optimized_v1.pkl")
+    
     if (not force_refit) and osp.exists(save_path):
         print(f"[ShapeFit] load existing {save_path}")
         shape_new, scale = joblib.load(save_path)
@@ -271,16 +235,16 @@ def ensure_shape_file(
 
 
 # --------------------------
-# Retarget: PKL
+# Retarget: AMASS
 # --------------------------
-def process_motion_from_pkl(key_names, key_name_to_pkls, cfg):
-    """处理来自pkl文件的motion数据"""
+def process_motion(key_names, key_name_to_pkls, cfg):
     device = torch.device("cpu")
 
-    humanoid_fk = Humanoid_Batch(cfg.robot)  # load FK model
+    humanoid_fk = Humanoid_Batch(cfg.robot)
     num_augment_joint = len(cfg.robot.extend_config)
     print(f"[DEBUG] robot body names: {humanoid_fk.body_names}")
     print(f"[DEBUG] robot parents: {humanoid_fk._parents}")
+    print(f"[DEBUG] robot num_dof: {humanoid_fk.num_dof}")
 
     # 关节映射
     robot_joint_names_augment = humanoid_fk.body_names_augment
@@ -302,186 +266,11 @@ def process_motion_from_pkl(key_names, key_name_to_pkls, cfg):
     all_data = {}
     pbar = tqdm(key_names, position=0, leave=True)
     for data_key in pbar:
-        pkl_data = load_pkl_data(key_name_to_pkls[data_key])
-        if pkl_data is None:
-            continue
-
-        # 已处理过的格式直接收下
-        if isinstance(pkl_data, dict) and any(
-            isinstance(v, dict) and ("root_trans_offset" in v and "pose_aa" in v)
-            for v in pkl_data.values()
-        ):
-            print(f"Data {data_key} already processed, loading directly")
-            all_data.update(pkl_data)
-            continue
-
-        # 提取原始数据
-        motion_info = extract_data_from_pkl(pkl_data)
-        if motion_info is None:
-            continue
-
-        trans = torch.from_numpy(motion_info["trans"]).float()
-        pose_aa_walk = torch.from_numpy(motion_info["pose_aa"]).float()
-        N = trans.shape[0]
-        if N < 10:
-            print("Motion too short")
-            continue
-
-        with torch.no_grad():
-            verts, joints = smpl_parser_n.get_joints_verts(pose_aa_walk, shape_new, trans)
-            root_pos = joints[:, 0:1]
-            joints = (joints - joints[:, 0:1]) * scale.detach() + root_pos
-        joints[..., 2] -= verts[0, :, 2].min().item()
-
-        offset = joints[:, 0] - trans
-        root_trans_offset = (trans + offset).clone()
-
-        # 根部旋转（去pitch&roll，只保留第一帧yaw）
-        gt_root_rot_quat = torch.from_numpy(
-            (sRot.from_rotvec(pose_aa_walk[:, :3]) * sRot.from_quat([0.5, 0.5, 0.5, 0.5]).inv()).as_quat()
-        ).float()
-        gt_root_rot = torch.from_numpy(
-            sRot.from_quat(torch_utils.calc_heading_quat(gt_root_rot_quat)).as_rotvec()
-        ).float()
-        gt_root_rot[:, 0] = 0.0
-        gt_root_rot[:, 1] = 0.0
-        first_frame_z = gt_root_rot[0, 2].clone()
-        gt_root_rot[:, 2] = first_frame_z
-
-        # 优化（拟合 robot dof 到 SMPL 关键点）
-        dof_pos = torch.zeros((1, N, humanoid_fk.num_dof, 1))
-        dof_pos_new = Variable(dof_pos.clone(), requires_grad=True)
-        root_rot_new = Variable(gt_root_rot.clone(), requires_grad=True)
-        root_pos_offset = Variable(torch.zeros(1, 3), requires_grad=True)
-        optimizer = torch.optim.Adam([dof_pos_new, root_rot_new, root_pos_offset], lr=0.02)
-
-        kernel_size = 5
-        sigma = 0.75
-
-        for iteration in range(cfg.get("fitting_iterations", 500)):
-            with torch.no_grad():
-                root_rot_new.data[:, 0] = 0.0
-                root_rot_new.data[:, 1] = 0.0
-                root_rot_new.data[:, 2] = first_frame_z
-
-            pose_aa_h1_new = torch.cat(
-                [
-                    root_rot_new[None, :, None],
-                    humanoid_fk.dof_axis * dof_pos_new,
-                    torch.zeros((1, N, num_augment_joint, 3)),
-                ],
-                axis=2,
-            )
-            fk_return = humanoid_fk.fk_batch(
-                pose_aa_h1_new, root_trans_offset[None,] + root_pos_offset
-            )
-
-            if num_augment_joint > 0:
-                diff = fk_return.global_translation_extend[:, :, robot_joint_pick_idx] - joints[:, smpl_joint_pick_idx]
-            else:
-                diff = fk_return.global_translation[:, :, robot_joint_pick_idx] - joints[:, smpl_joint_pick_idx]
-
-            loss_g = diff.norm(dim=-1).mean() + 0.01 * torch.mean(torch.square(dof_pos_new))
-            loss = loss_g
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            with torch.no_grad():
-                root_rot_new.data[:, 0] = 0.0
-                root_rot_new.data[:, 1] = 0.0
-                root_rot_new.data[:, 2] = first_frame_z
-
-            dof_pos_new.data.clamp_(humanoid_fk.joints_range[:, 0, None], humanoid_fk.joints_range[:, 1, None])
-            # 平滑
-            dof_pos_new.data = gaussian_filter_1d_batch(
-                dof_pos_new.squeeze().transpose(1, 0)[None,], kernel_size, sigma
-            ).transpose(2, 1)[..., None]
-
-            tqdm.write(f"{data_key}-Iter: {iteration}\t{loss.item() * 1000:.3f}")
-
-        dof_pos_new.data.clamp_(humanoid_fk.joints_range[:, 0, None], humanoid_fk.joints_range[:, 1, None])
-        with torch.no_grad():
-            root_rot_new.data[:, 0] = 0.0
-            root_rot_new.data[:, 1] = 0.0
-            root_rot_new.data[:, 2] = first_frame_z
-
-        pose_aa_h1_new = torch.cat(
-            [
-                root_rot_new[None, :, None],
-                humanoid_fk.dof_axis * dof_pos_new,
-                torch.zeros((1, N, num_augment_joint, 3)),
-            ],
-            axis=2,
-        )
-
-        root_trans_offset_dump = (root_trans_offset + root_pos_offset).clone()
-
-        # 落地校正 + 轻微下沉
-        combined_mesh = humanoid_fk.mesh_fk(
-            pose_aa_h1_new[:, :1].detach(), root_trans_offset_dump[None, :1].detach()
-        )
-        height_diff = np.asarray(combined_mesh.vertices)[..., 2].min()
-        root_trans_offset_dump[..., 2] -= height_diff
-        joints_dump = joints.numpy().copy()
-        joints_dump[..., 2] -= height_diff
-
-        z_offset = -0.04
-        root_trans_offset_dump[..., 2] += z_offset
-        joints_dump[..., 2] += z_offset
-
-        # 输出的 root 四元数（仅保留统一yaw）
-        root_rot_vec = root_rot_new.detach().clone().numpy()
-        root_rot_fixed = np.zeros_like(root_rot_vec)
-        root_rot_fixed[:, 2] = first_frame_z.item()
-        root_rot_quat_clean = sRot.from_rotvec(root_rot_fixed).as_quat()
-        root_rot_quat_clean = root_rot_quat_clean / np.linalg.norm(root_rot_quat_clean, axis=1, keepdims=True)
-
-        data_dump = {
-            "root_trans_offset": root_trans_offset_dump.squeeze().detach().numpy(),
-            "pose_aa": pose_aa_h1_new.squeeze().detach().numpy(),
-            "dof": dof_pos_new.squeeze().detach().numpy(),
-            "root_rot": root_rot_quat_clean,
-            "smpl_joints": joints_dump,
-            "fps": 30,
-        }
-        all_data[data_key] = data_dump
-    return all_data
-
-
-# --------------------------
-# Retarget: AMASS
-# --------------------------
-def process_motion(key_names, key_name_to_pkls, cfg):
-    device = torch.device("cpu")
-
-    humanoid_fk = Humanoid_Batch(cfg.robot)
-    num_augment_joint = len(cfg.robot.extend_config)
-    print(f"[DEBUG] robot body names: {humanoid_fk.body_names}")
-    print(f"[DEBUG] robot parents: {humanoid_fk._parents}")
-
-    robot_joint_names_augment = humanoid_fk.body_names_augment
-    robot_joint_pick = [i[0] for i in cfg.robot.joint_matches]
-    smpl_joint_pick = [i[1] for i in cfg.robot.joint_matches]
-    robot_joint_pick_idx = [robot_joint_names_augment.index(j) for j in robot_joint_pick]
-    smpl_joint_pick_idx = [SMPL_BONE_ORDER_NAMES.index(j) for j in smpl_joint_pick]
-
-    smpl_model_path = cfg.get("smpl_model_path", "data/smpl")
-    smpl_parser_n = SMPL_Parser(model_path=smpl_model_path, gender="neutral")
-    try:
-        shape_new, scale = joblib.load(f"data/{cfg.robot.humanoid_type}/shape_optimized_v1.pkl")
-    except:
-        print("Warning: shape_optimized_v1.pkl not found, using default shape and scale")
-        shape_new = torch.zeros([1, 10])
-        scale = torch.ones([1])
-
-    all_data = {}
-    pbar = tqdm(key_names, position=0, leave=True)
-    for data_key in pbar:
         amass_data = load_amass_data(key_name_to_pkls[data_key])
         if amass_data is None:
             continue
+        
+        # 重采样到30fps
         skip = int(amass_data["fps"] // 30)
         trans = torch.from_numpy(amass_data["trans"][::skip]).float()
         N = trans.shape[0]
@@ -491,6 +280,7 @@ def process_motion(key_names, key_name_to_pkls, cfg):
             print("Motion too short")
             continue
 
+        # 使用SMPL模型生成关节位置
         with torch.no_grad():
             verts, joints = smpl_parser_n.get_joints_verts(pose_aa_walk, shape_new, trans)
             root_pos = joints[:, 0:1]
@@ -500,17 +290,21 @@ def process_motion(key_names, key_name_to_pkls, cfg):
         offset = joints[:, 0] - trans
         root_trans_offset = (trans + offset).clone()
 
+        # 根部旋转处理 - 只去除pitch&roll，保留原始yaw变化
         gt_root_rot_quat = torch.from_numpy(
             (sRot.from_rotvec(pose_aa_walk[:, :3]) * sRot.from_quat([0.5, 0.5, 0.5, 0.5]).inv()).as_quat()
         ).float()
         gt_root_rot = torch.from_numpy(
             sRot.from_quat(torch_utils.calc_heading_quat(gt_root_rot_quat)).as_rotvec()
         ).float()
-        gt_root_rot[:, 0] = 0.0
-        gt_root_rot[:, 1] = 0.0
-        first_frame_z = gt_root_rot[0, 2].clone()
-        gt_root_rot[:, 2] = first_frame_z
+        
+        gt_root_rot[:, 0] = 0.0  # x (pitch) - 固定为0
+        gt_root_rot[:, 1] = 0.0  # y (roll) - 固定为0
+        # z (yaw) - 保留原始转弯变化，不修改
+        # first_frame_z = gt_root_rot[0, 2].clone()
+        # gt_root_rot[:, 2] = first_frame_z  # 注释掉这行来允许转弯
 
+        # 优化 - 拟合robot DOF到SMPL关节位置
         dof_pos = torch.zeros((1, N, humanoid_fk.num_dof, 1))
         dof_pos_new = Variable(dof_pos.clone(), requires_grad=True)
         root_rot_new = Variable(gt_root_rot.clone(), requires_grad=True)
@@ -521,23 +315,25 @@ def process_motion(key_names, key_name_to_pkls, cfg):
         sigma = 0.75
 
         for iteration in range(cfg.get("fitting_iterations", 500)):
+            # 只约束pitch和roll，不约束yaw
             with torch.no_grad():
-                root_rot_new.data[:, 0] = 0.0
-                root_rot_new.data[:, 1] = 0.0
-                root_rot_new.data[:, 2] = first_frame_z
+                root_rot_new.data[:, 0] = 0.0  # 固定pitch
+                root_rot_new.data[:, 1] = 0.0  # 固定roll
+                # 不约束yaw，让它保持原始转弯动作
 
-            pose_aa_h1_new = torch.cat(
-                [
-                    root_rot_new[None, :, None],
-                    humanoid_fk.dof_axis * dof_pos_new,
-                    torch.zeros((1, N, num_augment_joint, 3)),
-                ],
-                axis=2,
-            )
+            # 构建完整pose_aa: root_rot + dof_rot + augment_joints
+            pose_aa_h1_new = torch.cat([
+                root_rot_new[None, :, None],
+                humanoid_fk.dof_axis * dof_pos_new,
+                torch.zeros((1, N, num_augment_joint, 3))
+            ], axis=2)
+            
+            # 前向运动学
             fk_return = humanoid_fk.fk_batch(
                 pose_aa_h1_new, root_trans_offset[None,] + root_pos_offset
             )
 
+            # 计算损失 - 机器人关节位置与SMPL关节位置的差异
             if num_augment_joint > 0:
                 diff = fk_return.global_translation_extend[:, :, robot_joint_pick_idx] - joints[:, smpl_joint_pick_idx]
             else:
@@ -550,35 +346,37 @@ def process_motion(key_names, key_name_to_pkls, cfg):
             loss.backward()
             optimizer.step()
 
+            # 再次只约束pitch和roll
             with torch.no_grad():
                 root_rot_new.data[:, 0] = 0.0
                 root_rot_new.data[:, 1] = 0.0
-                root_rot_new.data[:, 2] = first_frame_z
+                # yaw保持优化结果，不固定
 
+            # 关节限制和平滑
             dof_pos_new.data.clamp_(humanoid_fk.joints_range[:, 0, None], humanoid_fk.joints_range[:, 1, None])
             dof_pos_new.data = gaussian_filter_1d_batch(
                 dof_pos_new.squeeze().transpose(1, 0)[None,], kernel_size, sigma
             ).transpose(2, 1)[..., None]
 
-            tqdm.write(f"{data_key}-Iter: {iteration}\t{loss.item() * 1000:.3f}")
+            if iteration % 50 == 0:
+                tqdm.write(f"{data_key}-Iter: {iteration}\t{loss.item() * 1000:.3f}")
 
+        # 最终约束和构建 - 只约束pitch和roll
         dof_pos_new.data.clamp_(humanoid_fk.joints_range[:, 0, None], humanoid_fk.joints_range[:, 1, None])
         with torch.no_grad():
-            root_rot_new.data[:, 0] = 0.0
-            root_rot_new.data[:, 1] = 0.0
-            root_rot_new.data[:, 2] = first_frame_z
+            root_rot_new.data[:, 0] = 0.0  # 固定pitch
+            root_rot_new.data[:, 1] = 0.0  # 固定roll
+            # yaw保持自由，允许转弯
 
-        pose_aa_h1_new = torch.cat(
-            [
-                root_rot_new[None, :, None],
-                humanoid_fk.dof_axis * dof_pos_new,
-                torch.zeros((1, N, num_augment_joint, 3)),
-            ],
-            axis=2,
-        )
+        pose_aa_h1_new = torch.cat([
+            root_rot_new[None, :, None],
+            humanoid_fk.dof_axis * dof_pos_new,
+            torch.zeros((1, N, num_augment_joint, 3))
+        ], axis=2)
 
         root_trans_offset_dump = (root_trans_offset + root_pos_offset).clone()
 
+        # 落地校正
         combined_mesh = humanoid_fk.mesh_fk(
             pose_aa_h1_new[:, :1].detach(), root_trans_offset_dump[None, :1].detach()
         )
@@ -588,14 +386,15 @@ def process_motion(key_names, key_name_to_pkls, cfg):
         joints_dump = joints.numpy().copy()
         joints_dump[..., 2] -= height_diff
 
+        # 轻微下沉
         z_offset = -0.04
         root_trans_offset_dump[..., 2] += z_offset
         joints_dump[..., 2] += z_offset
 
+        # 根部四元数 - 保留原始yaw变化
         root_rot_vec = root_rot_new.detach().clone().numpy()
-        root_rot_fixed = np.zeros_like(root_rot_vec)
-        root_rot_fixed[:, 2] = first_frame_z.item()
-        root_rot_quat_clean = sRot.from_rotvec(root_rot_fixed).as_quat()
+        # 不再固定yaw，保持转弯动作
+        root_rot_quat_clean = sRot.from_rotvec(root_rot_vec).as_quat()
         root_rot_quat_clean = root_rot_quat_clean / np.linalg.norm(root_rot_quat_clean, axis=1, keepdims=True)
 
         data_dump = {
@@ -605,6 +404,9 @@ def process_motion(key_names, key_name_to_pkls, cfg):
             "root_rot": root_rot_quat_clean,
             "smpl_joints": joints_dump,
             "fps": 30,
+            # 元信息
+            "dof_names": list(cfg.robot.dof_names),
+            "model": cfg.robot.asset.assetFileName,
         }
         all_data[data_key] = data_dump
     return all_data
@@ -615,7 +417,7 @@ def process_motion(key_names, key_name_to_pkls, cfg):
 # --------------------------
 @hydra.main(version_base=None, config_path="/home/dy/dy/code/unitree_ti/amp-rsl-rl/amp_datasets/cfg", config_name="taihu")
 def main(cfg: DictConfig) -> None:
-    # 先确保 shape 文件（若cfg开启do_shape_fit 或 文件缺失会自动拟合/生成）
+    # 先确保shape文件存在
     smpl_model_path = cfg.get("smpl_model_path", "data/smpl")
     if cfg.get("do_shape_fit", False):
         ensure_shape_file(
@@ -627,51 +429,41 @@ def main(cfg: DictConfig) -> None:
             force_refit=cfg.get("shape_fit_force_refit", False),
         )
 
-    # 选择数据源并准备列表
-    if "pkl_root" in cfg:
-        pkl_root = cfg.pkl_root
-        print(f"Processing pkl files from: {pkl_root}")
-        all_pkls = glob.glob(f"{pkl_root}/**/*.pkl", recursive=True)
-        print(f"Found {len(all_pkls)} pkl files")
-        split_len = len(pkl_root.split("/"))
-        key_name_to_pkls = {"pkl-" + "_".join(p.split("/")[split_len:]).replace(".pkl", ""): p for p in all_pkls}
-        key_names = list(key_name_to_pkls.keys())
-        process_function = process_motion_from_pkl
+    # AMASS数据处理
+    if "amass_root" not in cfg:
+        raise ValueError("amass_root must be specified in the config")
 
-    elif "amass_root" in cfg:
-        amass_root = cfg.amass_root
-        print(f"Processing AMASS files from: {amass_root}")
-        all_pkls = glob.glob(f"{amass_root}/**/*.npz", recursive=True)
-        split_len = len(amass_root.split("/"))
-        key_name_to_pkls = {"0-" + "_".join(p.split("/")[split_len:]).replace(".npz", ""): p for p in all_pkls}
-        key_names = list(key_name_to_pkls.keys())
-        process_function = process_motion
-
-    else:
-        raise ValueError("Either pkl_root or amass_root must be specified in the config")
+    amass_root = cfg.amass_root
+    print(f"Processing AMASS files from: {amass_root}")
+    all_npzs = glob.glob(f"{amass_root}/**/*.npz", recursive=True)
+    print(f"Found {len(all_npzs)} npz files")
+    
+    split_len = len(amass_root.split("/"))
+    key_name_to_pkls = {"0-" + "_".join(p.split("/")[split_len:]).replace(".npz", ""): p for p in all_npzs}
+    key_names = list(key_name_to_pkls.keys())
 
     print(f"Processing {len(key_names)} files")
 
     if not cfg.get("fit_all", False):
-        # 调试只跑一个
+        # 调试只处理一个文件
         key_names = key_names[:1] if key_names else []
 
+    # 多进程处理
     torch.set_num_threads(1)
     mp.set_sharing_strategy("file_descriptor")
-    jobs = key_names
     num_jobs = 30
-    chunk = int(np.ceil(len(jobs) / num_jobs))
-    jobs = [jobs[i : i + chunk] for i in range(0, len(jobs), chunk)]
+    chunk = int(np.ceil(len(key_names) / num_jobs))
+    jobs = [key_names[i:i + chunk] for i in range(0, len(key_names), chunk)]
     job_args = [(jobs[i], key_name_to_pkls, cfg) for i in range(len(jobs))]
     print(f"Created {len(job_args)} job chunks")
 
     if len(job_args) == 1:
-        all_data = process_function(key_names, key_name_to_pkls, cfg)
+        all_data = process_motion(key_names, key_name_to_pkls, cfg)
         print(f"Processed {len(all_data)} motions")
     else:
         try:
             pool = mp.Pool(num_jobs)
-            all_data_list = pool.starmap(process_function, job_args)
+            all_data_list = pool.starmap(process_motion, job_args)
         except KeyboardInterrupt:
             pool.terminate()
             pool.join()
@@ -690,8 +482,9 @@ def main(cfg: DictConfig) -> None:
 
     print(f"Total {len(all_data)} motions saved to {save_dir}")
 
+    # 验证
     humanoid_fk = Humanoid_Batch(cfg.robot)
-    print(humanoid_fk.body_names)
+    print(f"Robot has {humanoid_fk.num_dof} DOFs: {humanoid_fk.body_names}")
 
 
 if __name__ == "__main__":

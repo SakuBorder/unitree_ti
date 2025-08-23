@@ -340,7 +340,7 @@ class AMP_PPO:
                 with torch.no_grad():
                     policy_state = self.amp_normalizer.normalize(policy_state)
                     policy_next_state = self.amp_normalizer.normalize(policy_next_state)
-                    import ipdb;ipdb.set_trace()
+                    # import ipdb;ipdb.set_trace()
 
                     expert_state = self.amp_normalizer.normalize(expert_state)
                     expert_next_state = self.amp_normalizer.normalize(expert_next_state)
