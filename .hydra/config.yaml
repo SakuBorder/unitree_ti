@@ -1,11 +1,12 @@
 amass_root: /home/dy/dy/code/unitree_ti/amp_datasets/npz
 fit_all: true
 fitting_iterations: 500
+default_fps: 30
 robot:
   humanoid_type: ti512
   asset:
     assetRoot: /home/dy/dy/code/unitree_ti/assert/ti5/
-    assetFileName: /home/dy/dy/code/unitree_ti/assert/ti5/ti5_12dof.xml
+    assetFileName: /home/dy/dy/code/unitree_ti/assert/ti5/ti.xml
     urdfFileName: tai5_12dof_no_limit.urdf
   base_link: base_link
   body_names:

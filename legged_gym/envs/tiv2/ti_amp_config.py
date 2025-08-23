@@ -6,7 +6,7 @@ class TiV2AMPCfg(LeggedRobotCfg):
 
     class init_state(LeggedRobotCfg.init_state):
         pos = [0.0, 1.0, 0.95]  # x,y,z [m]
-        default_joint_angles = {  # 与原TiV2保持一致
+        default_joint_angles = {
             'L_ANKLE_R': 0.,
             'R_ANKLE_R': 0,
             'L_ANKLE_P': 0.2,
@@ -28,7 +28,7 @@ class TiV2AMPCfg(LeggedRobotCfg):
         # AMP 观测维度：12(q) + 12(dq) + 3(v_base_local) + 3(w_base_local) = 30
         num_amp_obs = 30
 
-        # 维度保持与现有栈一致（用于 282/50）
+        # 与现有栈保持一致（actor=282, critic=50）
         num_one_step_observations = 2 * 12 + 11 + 12  # 47
         num_one_step_privileged_obs = num_one_step_observations + 3  # 50
         num_actor_history = 6
@@ -90,7 +90,7 @@ class TiV2AMPCfg(LeggedRobotCfg):
         base_height_target = 0.92
 
         class scales(LeggedRobotCfg.rewards.scales):
-            # —— 保留“最小任务 + 安全/正则”的通用设置 ——
+            # —— 最小任务 + 安全/正则 ——
             tracking_lin_vel = 1.0
             tracking_ang_vel = 1.0
             action_rate = -0.01
@@ -98,7 +98,7 @@ class TiV2AMPCfg(LeggedRobotCfg):
             collision = -1.0
             alive = 0.05
 
-            # —— 容易与风格冲突/或量级过大的项，先关闭（0.0）——
+            # —— 先关闭，避免与风格冲突 ——
             lin_vel_z = 0.0
             ang_vel_xy = 0.0
             orientation = 0.0
@@ -115,19 +115,6 @@ class TiV2AMPCfg(LeggedRobotCfg):
             lin_acc = 0.0
             contact_momentum = 0.0
 
-    # 仅供环境内部使用的 AMP 可见配置（保持与 PPO 一致）
-    class amp:
-        amp_data_path = "/home/dy/dy/code/unitree_ti/data/ti512/v1/singles"
-        dataset_names = ["0-Male2Walking_c3d_B9 -  Walk turn left 90_poses"]
-        dataset_weights = [1.0]
-        slow_down_factor = 1
-        num_amp_obs = 30
-        dt = 1.0/60.0
-        decimation = 4
-        replay_buffer_size = 100000
-        reward_scale = 2.0
-        joint_names = None
-
     class observations:
         class amp:
             joint_pos = True
@@ -142,7 +129,7 @@ class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
     class runner:
         runner_class_name = "AMPOnPolicyRunner"
         algorithm_class_name = "AMP_PPO"
-        policy_class_name = "ActorCriticMoE"  # 或 "ActorCritic"
+        policy_class_name = "ActorCriticMoE"   # 或 "ActorCritic"
         experiment_name = "tiv2_amp"
         run_name = "tiv2_amp_run"
         resume = False
@@ -158,9 +145,8 @@ class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
         actor_hidden_dims = [512, 256, 128]
         critic_hidden_dims = [512, 256, 128]
         activation = 'elu'
-        # MoE 参数（仅在使用 ActorCriticMoE 时生效）
+        # 使用 MoE 时只保留必要字段，避免无效参数告警
         num_experts = 4
-        gate_hidden_dims = None  # 使用默认
 
     class algorithm:
         # 与 AMP_PPO.__init__ 对齐
@@ -181,24 +167,25 @@ class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
 
     class discriminator:
         hidden_dims = [1024, 512]
-        reward_scale = 2.0  # 如需更强风格，可升到 5.0~10.0 再观察
+        reward_scale = 2.0
         loss_type = "BCEWithLogits"
         eta_wgan = 0.3
         reward_clamp_epsilon = 1e-4
 
-    # Runner 会从这里读取 AMP 相关项（含融合权重）
+    # ★ 唯一生效的 AMP 段：Runner 只读取这里的配置
     class amp:
         amp_data_path = "/home/dy/dy/code/unitree_ti/data/ti512/v1/singles"
-        dataset_names = ["0-Male2Walking_c3d_B9 -  Walk turn left 90_poses"]
-        dataset_weights = [1.0]
+        # 读取该目录下的所有专家文件（.pkl/.npy/.npz/.pt）
+        dataset_names = ["walk","maikan"]
+        dataset_weights = [0.2,0.8]
         slow_down_factor = 1
         num_amp_obs = 30
         dt = 1.0/60.0
         decimation = 4
         replay_buffer_size = 100000
-        reward_scale = 2.0  # 这里保留同名字段无碍（Runner 只把它并入 amp_cfg）
+        reward_scale = 2.0
         joint_names = None
 
-        # ★ 新增：任务/风格融合权重（Runner 中已支持）
+        # 任务/风格融合权重（Runner 已支持）
         style_weight = 0.5
         task_weight  = 0.5

@@ -96,6 +96,8 @@ class AMPOnPolicyRunner:
     """
 
     def __init__(self, env: VecEnv, train_cfg, log_dir=None, device="cpu"):
+        from pathlib import Path  # ← 新增：用于目录扫描
+
         self.env = env
         self.device = device
 
@@ -162,62 +164,162 @@ class AMPOnPolicyRunner:
         joint_names = self.amp_cfg.get("joint_names", None)
 
         amp_data_path = self.amp_cfg.get("amp_data_path", None)
-        dataset_names = self.amp_cfg.get("dataset_names", [])
-        dataset_weights = self.amp_cfg.get("dataset_weights", [])
+        dataset_names = list(self.amp_cfg.get("dataset_names", []) or [])
+        dataset_weights = list(self.amp_cfg.get("dataset_weights", []) or [])
         slow_down_factor = self.amp_cfg.get("slow_down_factor", 1)
 
+        # === 目录展开逻辑（关键修改） ===
+        # 场景：dataset_names = ["walk"] 且 amp_data_path = ".../singles"
+        # 若 singles/walk 是目录，则枚举其中所有文件，取 stem 作为数据集名，并保留子目录前缀 "walk/<stem>"
+        if amp_data_path is None:
+            raise RuntimeError("AMP config requires 'amp_data_path'.")
+
+        root = Path(amp_data_path)
+        if len(dataset_names) == 1:
+            maybe_dir = root / dataset_names[0]
+            if maybe_dir.is_dir():
+                # 支持的文件后缀（可根据你的数据进行调整/增减）
+                exts = {".npy", ".npz", ".pt", ".pkl"}
+                files = [p for p in maybe_dir.iterdir() if p.is_file() and p.suffix in exts]
+                files.sort()
+                if len(files) == 0:
+                    print(f"[AMP DATA] Warning: directory '{maybe_dir}' is empty or has no supported files {sorted(list(exts))}.")
+                # 产生形如 "walk/<stem>" 的名字，保持子目录结构
+                dataset_names = [f"{maybe_dir.name}/{p.stem}" for p in files]
+                # 权重对齐（未提供或长度不足则补 1.0）
+                if len(dataset_weights) != len(dataset_names):
+                    dataset_weights = [1.0] * len(dataset_names)
+                print(f"[AMP DATA] Expanded directory '{maybe_dir}': {len(dataset_names)} files found.")
+            elif not maybe_dir.exists():
+                # 若不是目录且也不存在同名文件/子目录，保留原样但给出提示
+                print(f"[AMP DATA] Note: '{maybe_dir}' not a directory; will treat '{dataset_names[0]}' as a single clip name.")
+
+        # 若权重还未对齐（例如 dataset_names 本来就是若干具体名字）
+        if dataset_weights and len(dataset_weights) != len(dataset_names):
+            # 截断或补 1.0 以匹配长度
+            if len(dataset_weights) > len(dataset_names):
+                dataset_weights = dataset_weights[:len(dataset_names)]
+            else:
+                dataset_weights = dataset_weights + [1.0] * (len(dataset_names) - len(dataset_weights))
+
+        # 构造 AMPLoader
+        # 构造 AMPLoader
         amp_data = AMPLoader(
             self.device,
-            amp_data_path,
+            str(root),
             dataset_names,
             dataset_weights,
             delta_t,
             slow_down_factor,
             joint_names,
         )
+        self.amp_data = amp_data  # 暴露供调试
 
-        # === AMP 数据摘要（打印 + 存起来，稍后写入 TensorBoard） ===
-        self.amp_data = amp_data  # 以备需要时访问
+        # === 注入到环境，并确保首次复位就使用专家状态 ===
+        if hasattr(self.env, "set_amp_data"):
+            self.env.set_amp_data(self.amp_data)
+        try:
+            # 用专家热启动覆盖一次（而不是等到第一步 dones 才覆盖）
+            all_ids = torch.arange(self.env.num_envs, device=self.device, dtype=torch.long)
+            if hasattr(self.env, "reset_idx"):
+                self.env.reset_idx(all_ids)
+            else:
+                self.env.reset()
+        except Exception as e:
+            print(f"[Runner] Soft-warn: initial AMP reset failed: {e}")
 
+
+
+        # === AMP 数据摘要（打印 + 训练时写入 TensorBoard） ===
         def _get_attr_any(obj, names):
             for name in names:
-                v = getattr(obj, name, None)
-                if v is not None:
-                    return v
+                if hasattr(obj, name):
+                    v = getattr(obj, name)
+                    if v is not None:
+                        return v
             return None
 
-        # 尝试拿到样本/转移数量（不同实现字段名可能不同）
-        num_pairs = _get_attr_any(amp_data, ["num_pairs", "num_samples", "size", "N", "length"])
+        num_pairs = _get_attr_any(amp_data, [
+            "num_pairs", "num_samples", "size", "N", "length", "total_pairs", "total_samples"
+        ])
         if num_pairs is None:
             try:
                 num_pairs = len(amp_data)
             except Exception:
                 num_pairs = "unknown"
 
-        # 数据集+权重的稳健拼接
         _ds = dataset_names or []
         _ws = dataset_weights or []
-        if _ws and len(_ws) != len(_ds):
-            _ws = _ws[:len(_ds)] + [1.0] * max(0, len(_ds) - len(_ws))
         if not _ws:
             _ws = [1.0] * len(_ds)
-
         datasets_line = ", ".join([f"{n}(w={w})" for n, w in zip(_ds, _ws)])
-        pairs_txt = f"{num_pairs}" if isinstance(num_pairs, (int, float)) else str(num_pairs)
 
+        container = _get_attr_any(amp_data, ["datasets", "clips", "sequences", "items", "sources"])
+        details_lines = []
+        if isinstance(container, (list, tuple)):
+            show_k = min(12, len(container))
+            for i in range(show_k):
+                item = container[i]
+                name = _get_attr_any(item, ["name", "id", "file", "path", "basename"]) or f"item_{i}"
+                length = _get_attr_any(item, ["num_pairs", "num_samples", "length", "size", "N"])
+                if length is None:
+                    try:
+                        length = len(item)
+                    except Exception:
+                        length = "?"
+                details_lines.append(f"  - #{i}: {name}, len={length}")
+            if len(container) > show_k:
+                details_lines.append(f"  - ... (+{len(container)-show_k} more)")
+
+        sample_preview = "n/a"
+        try:
+            sampler = getattr(amp_data, "sample_pairs", None)
+            if callable(sampler):
+                sample = amp_data.sample_pairs(2)
+                def _shape_of(x):
+                    try:
+                        import torch as _t
+                        if isinstance(x, _t.Tensor):
+                            return tuple(x.shape)
+                    except Exception:
+                        pass
+                    try:
+                        if hasattr(x, "shape"):
+                            return tuple(x.shape)
+                    except Exception:
+                        pass
+                    try:
+                        return f"len={len(x)}"
+                    except Exception:
+                        return type(x).__name__
+                if isinstance(sample, (list, tuple)):
+                    shapes = ", ".join(_shape_of(v) for v in sample)
+                    sample_preview = f"tuple[{len(sample)}]: {shapes}"
+                elif isinstance(sample, dict):
+                    parts = [f"{k}:{_shape_of(v)}" for k, v in sample.items()]
+                    sample_preview = "{ " + ", ".join(parts) + " }"
+                else:
+                    sample_preview = f"type={type(sample).__name__}"
+        except Exception as e:
+            sample_preview = f"peek failed: {e}"
+
+        pairs_txt = f"{num_pairs}" if isinstance(num_pairs, (int, float)) else str(num_pairs)
+        details_block = "\n".join(details_lines) if details_lines else "(no per-dataset detail available)"
         self._amp_data_text = (
-            f"path: {amp_data_path}\n"
+            f"path: {str(root)}\n"
             f"datasets: {datasets_line if datasets_line else '<none>'}\n"
             f"delta_t={delta_t:.6f}, decimation={decimation}, slow_down_factor={slow_down_factor}\n"
             f"num_amp_obs={num_amp_obs}, disc_input_dim={num_amp_obs * 2}\n"
-            f"estimated_pairs={pairs_txt}"
+            f"estimated_pairs={pairs_txt}\n"
+            f"per-dataset:\n{details_block}\n"
+            f"sample_pairs preview: {sample_preview}"
         )
-
         print("[AMP DATA] ==== Expert dataset summary ====")
         for line in self._amp_data_text.splitlines():
             print("[AMP DATA] " + line)
         print("[AMP DATA] =================================")
 
+        # 归一化器 & 判别器
         self.amp_normalizer = Normalizer(num_amp_obs, device=self.device)
         self.discriminator = Discriminator(
             input_dim=num_amp_obs * 2,  # current + next
@@ -281,9 +383,13 @@ class AMPOnPolicyRunner:
 
 
 
+
     # ----------------- 训练循环 -----------------
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
+        if hasattr(self.env, "reset"):
+            self.env.reset()
+
         # 随机化 episode 起点
         if init_at_random_ep_len and hasattr(self.env, "episode_length_buf") and hasattr(self.env, "max_episode_length"):
             self.env.episode_length_buf = torch.randint_like(self.env.episode_length_buf, high=int(self.env.max_episode_length))
@@ -513,11 +619,6 @@ class AMPOnPolicyRunner:
         except Exception as e:
             print(f"Warning: Failed to construct AMP observations from environment state: {e}")
 
-        # 方法3: 回退（截断/填充），打印警告
-        print(f"Warning: Using fallback AMP observation (simple truncation). This may not be correct!")
-        print(f"Expected AMP obs dim: {num_amp_obs}, got obs shape: {obs.shape}")
-        if obs.shape[-1] >= num_amp_obs:
-            return obs[..., :num_amp_obs]
         return obs
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):

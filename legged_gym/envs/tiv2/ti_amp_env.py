@@ -1,13 +1,16 @@
 # legged_gym/envs/tiv2/ti_amp_env.py
 from legged_gym.envs.tiv2.tiv2_env import TiV2Robot
 import torch
-from isaacgym.torch_utils import *
+from isaacgym.torch_utils import *  # quat_rotate, quat_rotate_inverse, etc.
+from isaacgym import gymtorch
+import torch.nn.functional as F
 
 
 class TiV2AMPRobot(TiV2Robot):
     def __init__(self, cfg, sim_params, physics_engine, sim_device, headless):
         super().__init__(cfg, sim_params, physics_engine, sim_device, headless)
         self.num_amp_obs = self._get_amp_obs_dim()
+        self.amp_data = None  # 由 runner 注入（见 set_amp_data）
 
         # 确保 phase 属性存在（父类 compute_observations 可能需要）
         if not hasattr(self, 'phase'):
@@ -18,6 +21,11 @@ class TiV2AMPRobot(TiV2Robot):
         print(f"[TiV2AMPRobot] Actor obs dim: {self.num_obs}")
         print(f"[TiV2AMPRobot] Critic obs dim: {self.num_privileged_obs}")
         print(f"[TiV2AMPRobot] AMP obs dim: {self.num_amp_obs}")
+
+    # --------- Runner 注入 AMPLoader 句柄（便于 reset 热启动）---------
+    def set_amp_data(self, amp_data):
+        """由 Runner 注入 AMPLoader 句柄。"""
+        self.amp_data = amp_data
 
     def _get_amp_obs_dim(self):
         """计算 AMP 观测的维度：12 dof pos + 12 dof vel + 3 lin vel + 3 ang vel = 30"""
@@ -175,3 +183,102 @@ class TiV2AMPRobot(TiV2Robot):
     def _reward_alive(self):
         """奖励存活"""
         return torch.ones(self.num_envs, dtype=torch.float, device=self.device)
+
+    # ------------------- 关键新增：专家帧“热启动”复位 -------------------
+    def reset_idx(self, env_ids):
+        """
+        覆盖父类 reset，以“专家帧热启动”重置这些 env：
+        - 若未注入 amp_data，则回退到父类默认行为。
+        - 若已注入，从专家数据随机采样 (quat_wxyz, qpos, qvel, vlin_local, vang_local)，
+        写入 root_states 与 dof 状态，并 push 到仿真。
+        """
+        # 1) 规范化 env_ids -> 1D Long tensor on device
+        if not isinstance(env_ids, torch.Tensor):
+            env_ids = torch.as_tensor(env_ids)
+        env_ids = env_ids.to(self.device, dtype=torch.long).reshape(-1)
+
+        # ★ 空批次直接早退，避免 0 样本采样/警告
+        if env_ids.numel() == 0:
+            return
+
+        # 2) 先让父类做地形/统计复位与一次 push
+        super().reset_idx(env_ids)
+
+        # 3) 没有 amp_data 就保留默认复位
+        if getattr(self, "amp_data", None) is None:
+            return
+
+        # 4) 用专家帧覆盖
+        n = env_ids.numel()
+        try:
+            quat, qpos, qvel, vlin_local, vang_local = self.amp_data.get_state_for_reset(n)
+        except Exception as e:
+            # 真异常才打印（空批次不会走到这里）
+            print(f"[TiV2AMPRobot] Warning: get_state_for_reset failed ({e}), fallback to default reset.")
+            return
+
+        # 设备/精度对齐
+        todev = lambda t: t.to(device=self.device, dtype=torch.float32)
+        quat        = todev(quat)        # (N, 4) wxyz
+        qpos        = todev(qpos)        # (N, dof?)
+        qvel        = todev(qvel)        # (N, dof?)
+        vlin_local  = todev(vlin_local)  # (N, 3)
+        vang_local  = todev(vang_local)  # (N, 3)
+
+        # DOF 维度对齐（数据集维度与环境不同则裁/补）
+        if qpos.shape[1] != self.num_dof:
+            if qpos.shape[1] > self.num_dof:
+                qpos = qpos[:, :self.num_dof]
+                qvel = qvel[:, :self.num_dof]
+            else:
+                pad = self.num_dof - qpos.shape[1]
+                qpos = torch.nn.functional.pad(qpos, (0, pad))
+                qvel = torch.nn.functional.pad(qvel, (0, pad))
+
+        # 局部 → 世界 的速度变换
+        vlin_world = quat_rotate(quat, vlin_local)
+        vang_world = quat_rotate(quat, vang_local)
+
+        # 写入本地缓冲区
+        ids = env_ids.long()  # 已在 self.device 上
+        # 根状态（仅覆盖姿态/速度，位置沿用父类默认出生点）
+        self.root_states[ids, 3:7]   = quat
+        self.root_states[ids, 7:10]  = vlin_world
+        self.root_states[ids, 10:13] = vang_world
+
+        if hasattr(self, "base_quat"):
+            self.base_quat[ids] = quat
+        if hasattr(self, "base_lin_vel"):
+            self.base_lin_vel[ids] = vlin_world
+        if hasattr(self, "base_ang_vel"):
+            self.base_ang_vel[ids] = vang_world
+
+        # 关节状态
+        self.dof_pos[ids, :] = qpos
+        self.dof_vel[ids, :] = qvel
+        if hasattr(self, "dof_state") and self.dof_state.ndim == 3:
+            self.dof_state[ids, :, 0] = qpos
+            self.dof_state[ids, :, 1] = qvel
+
+        # 5) push 到仿真（索引张量必须与状态张量在同一设备；GPU 管线必须传 GPU 张量）
+        try:
+            index_device = self.root_states.device  # 通常是 cuda:0（GPU PhysX）
+            env_ids_i32 = env_ids.to(device=index_device, dtype=torch.int32)
+
+            self.gym.set_actor_root_state_tensor_indexed(
+                self.sim,
+                gymtorch.unwrap_tensor(self.root_states),
+                gymtorch.unwrap_tensor(env_ids_i32),
+                env_ids_i32.numel(),
+            )
+
+            if hasattr(self, "dof_state") and self.dof_state.ndim == 3:
+                self.gym.set_dof_state_tensor_indexed(
+                    self.sim,
+                    gymtorch.unwrap_tensor(self.dof_state),
+                    gymtorch.unwrap_tensor(env_ids_i32),
+                    env_ids_i32.numel(),
+                )
+        except Exception as e:
+            print(f"[TiV2AMPRobot] Warning: failed to push AMP reset to sim: {e}")
+

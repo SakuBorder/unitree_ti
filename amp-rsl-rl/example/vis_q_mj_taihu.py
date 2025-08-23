@@ -67,7 +67,7 @@ def key_call_back(keycode):
         pass
 
 def _load_one_motion_file(base_dir, humanoid_type, motion_name=None):
-    singles_dir = osp.join("data", humanoid_type, "v1", "singles")
+    singles_dir = osp.join("data", humanoid_type, "v1", "singles", "maikan")
     if not osp.isabs(singles_dir):
         singles_dir = osp.abspath(singles_dir)
 
