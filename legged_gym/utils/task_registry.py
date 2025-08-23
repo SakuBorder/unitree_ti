@@ -8,10 +8,18 @@ import sys
 from rsl_rl.env import VecEnv
 from rsl_rl.runners import OnPolicyRunner
 from rsl_rl.runners.him_on_policy_runner import HIMOnPolicyRunner
+from amp_rsl_rl.runners.amp_on_policy_runner import AMPOnPolicyRunner
 
 from legged_gym import LEGGED_GYM_ROOT_DIR, LEGGED_GYM_ENVS_DIR
 from .helpers import get_args, update_cfg_from_args, class_to_dict, get_load_path, set_seed, parse_sim_params
 from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg, LeggedRobotCfgPPO
+
+# ===== 新增：可用 Runner 映射表 =====
+RUNNERS = {
+    "HIMOnPolicyRunner": HIMOnPolicyRunner,
+    "AMPOnPolicyRunner": AMPOnPolicyRunner,
+}
+
 
 class TaskRegistry():
     def __init__(self):
@@ -117,43 +125,30 @@ class TaskRegistry():
             log_dir = os.path.join(log_root, datetime.now().strftime('%b%d_%H-%M-%S') + '_' + train_cfg.runner.run_name)
         
         train_cfg_dict = class_to_dict(train_cfg)
-        # runner = OnPolicyRunner(env, train_cfg_dict, log_dir, device=args.rl_device)
-        runner = HIMOnPolicyRunner(env, train_cfg_dict, log_dir, device=args.rl_device)
+
+        # ===== 动态选择 Runner =====
+        runner_name = train_cfg.runner.runner_class_name if hasattr(train_cfg, "runner") else None
+        runner_name = runner_name or train_cfg_dict.get("runner", {}).get("runner_class_name") or "HIMOnPolicyRunner"
+
+        if runner_name not in RUNNERS:
+            raise ValueError(f"Unknown runner_class_name='{runner_name}', available={list(RUNNERS.keys())}")
+
+        runner_cls = RUNNERS[runner_name]
+        print(f"[TaskRegistry] Using runner: {runner_name}")
+        runner = runner_cls(env, train_cfg_dict, log_dir, device=args.rl_device)
+
         #save resume path before creating a new log_dir
         resume = train_cfg.runner.resume
         if resume:
             # load previously trained model
             # resume_path = get_load_path(log_root, load_run=train_cfg.runner.load_run, checkpoint=train_cfg.runner.checkpoint)
-            # resume_path = '/home/xu/Xu/research/human01/model_5000.pt' #walk
-            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug09_13-46-16_tiv2/model_2000.pt' #walk
-            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug10_15-53-13_tiv2/model_15500.pt'
-            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug11_18-09-54_tiv2/model_4000.pt'
-            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug11_19-41-00_tiv2/model_21500.pt'
-            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug12_12-50-46_tiv2/model_4000.pt'
-            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug12_14-01-55_tiv2/model_25500.pt' # history
-            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug12_21-24-59_tiv2/model_5500.pt' # 0.6 vel, 1.1 period
-            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug12_21-27-39_tiv2/model_5500.pt' # # 0.9 vel, 0.9 period
-            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug13_01-22-42_tiv2/model_2000.pt' # 0.6vel,0.9 period lin_acc+contact_momentum
-            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug13_01-22-56_tiv2/model_22000.pt' # 0.6vel,0.9 period contact_momentum
-            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug13_09-51-54_tiv2/model_1500.pt' # 0.6vel,0.9 period lin_acc+contact_momentum,0.145 feet height
-            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug13_12-54-51_tiv2/model_4500.pt'
-            # resume_path =   '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug13_17-59-21_tiv2/model_10000.pt'
-            # resume_path =   '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug14_00-14-13_tiv2/model_17500.pt'
-            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug14_14-46-26_tiv2/model_20000.pt'
-            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug14_18-26-14_tiv2/model_28000.pt'
-            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug14_22-57-47_tiv2/model_30000.pt'
-            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug15_13-35-09_tiv2/model_41500.pt'
-            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug17_13-20-43_tiv2/model_49000.pt'
-            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug18_10-06-37_tiv2/model_6500.pt'
-            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug18_23-57-25_tiv2/model_16000.pt'
-            resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug19_20-42-05_tiv2/model_11000.pt' ## godd walk
-            # resume_path = '/home/xu/Xu/research/human01/exp3_2.pt'
-            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug20_16-43-07_tiv2/model_13000.pt'
-            # resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug21_10-02-25_tiv2/model_32500.pt'
-            resume_path = '/home/dy/dy/code/unitree_ti/logs/ti-12dof-realpd/Aug22_15-57-02_tiv2/model_3500.pt'
+            # 下面两行按需保留/修改。注意：后一个会覆盖前一个。
+            resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug19_20-42-05_tiv2/model_11000.pt'  # example
+            resume_path = '/home/dy/dy/code/unitree_ti/logs/ti-12dof-realpd/Aug22_15-57-02_tiv2/model_10000.pt'      # example (覆盖上面)
             print(f"Loading model from: {resume_path}")
             runner.load(resume_path)
         return runner, train_cfg
+
 
 # make global task registry
 task_registry = TaskRegistry()

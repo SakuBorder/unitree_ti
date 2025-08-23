@@ -1,222 +1,222 @@
-# Copyright (c) 2025, Istituto Italiano di Tecnologia
-# All rights reserved.
-#
+# Copyright (c) 2025
 # SPDX-License-Identifier: BSD-3-Clause
 
-
 from __future__ import annotations
-
+import inspect
 import os
 import statistics
 import time
 from collections import deque
+from typing import Any, Dict, Optional, Tuple, List
 
 import torch
 from torch.utils.tensorboard import SummaryWriter as TensorboardSummaryWriter
 
 import rsl_rl
-import rsl_rl.utils
 from rsl_rl.env import VecEnv
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, EmpiricalNormalization
+from rsl_rl.modules import ActorCritic, ActorCriticRecurrent
+from rsl_rl.networks import EmpiricalNormalization
 from rsl_rl.utils import store_code_state
 
-from amp_rsl_rl.utils import Normalizer
-from amp_rsl_rl.utils import AMPLoader
+from amp_rsl_rl.utils import Normalizer, AMPLoader, export_policy_as_onnx
 from amp_rsl_rl.algorithms import AMP_PPO
-from amp_rsl_rl.networks import Discriminator, ActorCriticMoE
-from amp_rsl_rl.utils import export_policy_as_onnx
+from amp_rsl_rl.networks import Discriminator
+
+# 可选：如果有 MoE，尝试导入；没有就静默回退
+try:
+    from amp_rsl_rl.networks import ActorCriticMoE  # type: ignore
+    _HAS_MOE = True
+except Exception:
+    ActorCriticMoE = None  # type: ignore
+    _HAS_MOE = False
+
+
+# ----------------- 工具函数：兼容不同的 env API -----------------
+
+def _unpack_env_observations(env: VecEnv) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """
+    兼容以下两种形式：
+      - get_observations() -> obs
+      - get_observations() -> (obs, extras)
+    并尝试通过 env.get_privileged_observations() 获取 priv。
+    """
+    got = env.get_observations()
+    if isinstance(got, tuple):
+        obs = got[0]
+    else:
+        obs = got
+    priv = None
+    if hasattr(env, "get_privileged_observations"):
+        priv = env.get_privileged_observations()
+    return obs, priv
+
+
+def _unpack_env_step(ret: Any) -> Tuple[
+    torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor, Dict[str, Any], Optional[torch.Tensor], Optional[torch.Tensor]
+]:
+    """
+    将 env.step(...) 的返回统一解成：
+      (obs, priv, rewards, dones, infos, term_ids, term_priv)
+    支持：
+      - 7 元组: (obs, priv, rewards, dones, infos, termination_ids, termination_privileged_obs)
+      - 4 元组: (obs, rewards, dones, infos)
+    """
+    if isinstance(ret, tuple):
+        if len(ret) >= 7:
+            obs, priv, rewards, dones, infos, term_ids, term_priv = ret[:7]
+            return obs, priv, rewards, dones, infos, term_ids, term_priv
+        if len(ret) == 4:
+            obs, rewards, dones, infos = ret
+            return obs, None, rewards, dones, infos, None, None
+    raise RuntimeError(
+        f"Unsupported env.step(...) return signature: type={type(ret)}, len={len(ret) if isinstance(ret, tuple) else 'N/A'}"
+    )
+
+
+def _merge_amp_cfg(train_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    统一抽取 AMP 相关配置：
+      - 优先从 train_cfg['amp'] 读取
+      - 若有人把 amp 键放在顶层（amp_data_path 等），也一并合入
+    """
+    amp = dict(train_cfg.get("amp", {}))
+    for k in (
+        "amp_data_path", "dataset_names", "dataset_weights", "slow_down_factor",
+        "num_amp_obs", "dt", "decimation", "replay_buffer_size", "reward_scale",
+        "joint_names"
+    ):
+        if k in train_cfg and k not in amp:
+            amp[k] = train_cfg[k]
+    return amp
 
 
 class AMPOnPolicyRunner:
     """
-    AMPOnPolicyRunner is a high-level orchestrator that manages the training and evaluation
-    of a policy using Adversarial Motion Priors (AMP) combined with on-policy reinforcement learning (PPO).
-
-    It brings together multiple components:
-    - Environment (`VecEnv`)
-    - Policy (`ActorCritic`, `ActorCriticRecurrent`)
-    - Discriminator (Discriminator)
-    - Expert dataset (AMPLoader)
-    - Reward combination (task + style)
-    - Logging and checkpointing
-
-    ---
-    🔧 Configuration
-    ----------------
-    The class expects a `train_cfg` dictionary structured with keys:
-    - "policy": configuration for the policy network, including `"class_name"`
-    - "algorithm": configuration for PPO/AMP_PPO, including `"class_name"`
-    - "discriminator": configuration for the AMP discriminator
-    - "amp_data_path": path to folder containing expert dataset(s)
-    - "dataset_names": list of dataset filenames (without `.npy`)
-    - "dataset_weights": list of float weights used to sample from datasets
-    - "slow_down_factor": slowdown applied to real motion data to match sim dynamics
-    - "num_steps_per_env": rollout horizon per environment
-    - "save_interval": frequency (in iterations) for model checkpointing
-    - "empirical_normalization": whether to apply running observation normalization
-    - "logger": one of "tensorboard", "wandb", or "neptune"
-
-    ---
-    📦 Dataset format
-    ------------------
-    The expert motion datasets loaded via `AMPLoader` must be `.npy` files with a dictionary containing:
-
-    - `"joints_list"`: List[str] — ordered list of joint names
-    - `"joint_positions"`: List[np.ndarray] — joint configurations per timestep (1D arrays)
-    - `"root_position"`: List[np.ndarray] — base position in world coordinates
-    - `"root_quaternion"`: List[np.ndarray] — base orientation in **`xyzw`** format (SciPy default)
-    - `"fps"`: float — original dataset frame rate
-
-    Internally:
-    - Quaternions are interpolated via SLERP and converted to **`wxyz`** format before being used by the model (to match Isaac Gym convention).
-    - Velocities are estimated with finite differences.
-    - All data is converted to torch tensors and placed on the desired device.
-
-    ---
-    🎓 AMP Reward
-    -------------
-    During each training step, the runner collects AMP-specific observations and computes
-    a discriminator-based "style reward" from the expert dataset. This is combined
-    with the environment reward as:
-
-        `reward = 0.5 * task_reward + 0.5 * style_reward`
-
-    This can be later generalized into a weighted or learned reward mixing policy.
-
-    ---
-    🔁 Training loop
-    ----------------
-    The `learn()` method performs:
-    - `rollout`: collects data via `self.alg.act()` and `env.step()`
-    - `style_reward`: computed from discriminator via `predict_reward(...)`
-    - `storage update`: via `process_env_step()` and `process_amp_step()`
-    - `return computation`: via `compute_returns()`
-    - `update`: performs backpropagation with `self.alg.update()`
-    - Logging via TensorBoard/WandB/Neptune
-
-    ---
-    💾 Saving and ONNX export
-    --------------------------
-    At each `save_interval`, the runner:
-    - Saves the full state (`model`, `optimizer`, `discriminator`, `normalizer`, etc.)
-    - Optionally exports the policy as an ONNX model for deployment
-    - Uploads checkpoints to logging services if enabled
-
-    ---
-    📤 Inference policy
-    -------------------
-    `get_inference_policy()` returns a callable that takes an observation and returns an action.
-    If empirical normalization is enabled, observations are normalized before inference.
-
-    ---
-    🛠️ Additional tools
-    -------------------
-    - Git integration via `store_code_state()` to track code changes
-    - Logging of learning statistics, reward breakdown, discriminator metrics
-    - Compatible with multi-task setups via dataset weights
-
-    ---
-    📚 Notes
-    --------
-    - This runner assumes an AMP-compatible VecEnv, providing `observations["amp"]`
-    - AMP uses both current and next state to train the discriminator
-    - Logging behavior is separated from core logic (WandB, Neptune, TensorBoard)
-    - The Discriminator and AMP_PPO must follow expected APIs
-
+    AMP + PPO 训练器（兼容你当前 BaseTask 风格接口）
     """
 
     def __init__(self, env: VecEnv, train_cfg, log_dir=None, device="cpu"):
-        self.cfg = train_cfg
-        self.alg_cfg = train_cfg["algorithm"]
-        self.policy_cfg = train_cfg["policy"]
-        self.discriminator_cfg = train_cfg["discriminator"]
-        self.device = device
         self.env = env
+        self.device = device
 
-        # Get the size of the observation space
-        obs, extras = self.env.get_observations()
-        num_obs = obs.shape[1]
-        if "critic" in extras["observations"]:
-            num_critic_obs = extras["observations"]["critic"].shape[1]
-        else:
-            num_critic_obs = num_obs
-        actor_critic_class = eval(self.policy_cfg.pop("class_name"))  # ActorCritic
-        actor_critic: ActorCritic | ActorCriticRecurrent | ActorCriticMoE = (
-            actor_critic_class(
-                num_obs, num_critic_obs, self.env.num_actions, **self.policy_cfg
-            ).to(self.device)
-        )
-        # NOTE: to use this we need to configure the observations in the env coherently with amp observation. Tested with Manager Based envs in Isaaclab
-        amp_joint_names = self.env.cfg.observations.amp.joint_pos.params['asset_cfg'].joint_names
+        # -------- 配置拆解 --------
+        self.cfg = train_cfg
+        self.runner_cfg = dict(train_cfg.get("runner", {}))
+        self.policy_cfg = dict(train_cfg.get("policy", {}))
+        self.alg_cfg = dict(train_cfg.get("algorithm", {}))
+        self.discriminator_cfg = dict(train_cfg.get("discriminator", {}))
+        self.amp_cfg = _merge_amp_cfg(train_cfg)
+        self.logger_type = self.cfg.get("logger", "tensorboard").lower()
 
-        delta_t = self.env.cfg.sim.dt * self.env.cfg.decimation
+        # -------- 获取一帧观测维度 --------
+        obs0, priv0 = _unpack_env_observations(self.env)
+        if not isinstance(obs0, torch.Tensor):
+            raise RuntimeError("env.get_observations() must return a torch.Tensor or (Tensor, extras).")
+        num_actor_obs = int(obs0.shape[-1])
+        num_critic_obs = int(priv0.shape[-1]) if isinstance(priv0, torch.Tensor) else num_actor_obs
 
-        # Initilize all the ingredients required for AMP (discriminator, dataset loader)
-        num_amp_obs = extras["observations"]["amp"].shape[1]
-        amp_data = AMPLoader(
-            self.device,
-            self.cfg["amp_data_path"],
-            self.cfg["dataset_names"],
-            self.cfg["dataset_weights"],
-            delta_t,
-            self.cfg["slow_down_factor"],
-            amp_joint_names,
-        )
+        num_actions = getattr(self.env, "num_actions", None)
+        if num_actions is None:
+            raise RuntimeError("env.num_actions is required by AMPOnPolicyRunner.")
 
-        # self.env.unwrapped.scene["robot"].joint_names)
+        # -------- 策略网络选择（支持 MoE 回退） --------
+        policy_name = self.runner_cfg.get("policy_class_name", self.policy_cfg.get("class_name", "ActorCritic"))
+        policies: Dict[str, Any] = {"ActorCritic": ActorCritic}
+        if _HAS_MOE and ActorCriticMoE is not None:
+            policies["ActorCriticMoE"] = ActorCriticMoE
+        if policy_name not in policies:
+            print(f"[AMPOnPolicyRunner] Policy '{policy_name}' not found; falling back to 'ActorCritic'.")
+            policy_name = "ActorCritic"
+        policy_cls = policies[policy_name]
 
-        # amp_data = AMPLoader(num_amp_obs, self.device)
-        self.amp_normalizer = Normalizer(num_amp_obs, device=self.device)
-        self.discriminator = Discriminator(
-            input_dim=num_amp_obs* 2,  # the discriminator takes in the concatenation of the current and next observation
-            hidden_layer_sizes=self.discriminator_cfg["hidden_dims"],
-            reward_scale=self.discriminator_cfg["reward_scale"],
-            device=self.device,
-            loss_type=self.discriminator_cfg["loss_type"],
+        policy_kwargs = {k: v for k, v in self.policy_cfg.items() if k not in ("class_name",)}
+        self.actor_critic: ActorCritic | ActorCriticRecurrent | Any = policy_cls(
+            num_actor_obs=num_actor_obs,
+            num_critic_obs=num_critic_obs,
+            num_actions=num_actions,
+            **policy_kwargs,
         ).to(self.device)
 
-        # Initialize the PPO algorithm
-        alg_class = eval(self.alg_cfg.pop("class_name"))  # AMP_PPO
-        # This removes from alg_cfg fields that are not in AMP_PPO but are introduced in rsl_rl 2.2.3 PPO
-        # normalize_advantage_per_mini_batch=False,
-        # rnd_cfg: dict | None = None,
-        # symmetry_cfg: dict | None = None,
-        # multi_gpu_cfg: dict | None = None,
-        for key in list(self.alg_cfg.keys()):
-            if key not in AMP_PPO.__init__.__code__.co_varnames:
-                self.alg_cfg.pop(key)
+        # -------- AMP 组件 --------
+        # dt/decimation：优先从 env.cfg；取不到用 amp_cfg 兜底
+        dt = getattr(getattr(self.env, "cfg", None), "sim", None)
+        dt = getattr(dt, "dt", None)
+        decimation = getattr(getattr(self.env, "cfg", None), "control", None)
+        decimation = getattr(decimation, "decimation", None) or getattr(getattr(self.env, "cfg", None), "decimation", None)
+        if dt is None:
+            dt = float(self.amp_cfg.get("dt", 1.0 / 60.0))
+        if decimation is None:
+            decimation = int(self.amp_cfg.get("decimation", 1))
+        delta_t = float(dt) * int(decimation)
 
-        self.alg: AMP_PPO = alg_class(
-            actor_critic=actor_critic,
+        num_amp_obs = int(self.amp_cfg.get("num_amp_obs", num_actor_obs))
+        joint_names = self.amp_cfg.get("joint_names", None)
+
+        amp_data_path = self.amp_cfg.get("amp_data_path", None)
+        dataset_names = self.amp_cfg.get("dataset_names", [])
+        dataset_weights = self.amp_cfg.get("dataset_weights", [])
+        slow_down_factor = self.amp_cfg.get("slow_down_factor", 1)
+
+        amp_data = AMPLoader(
+            self.device,
+            amp_data_path,
+            dataset_names,
+            dataset_weights,
+            delta_t,
+            slow_down_factor,
+            joint_names,
+        )
+        self.amp_normalizer = Normalizer(num_amp_obs, device=self.device)
+        self.discriminator = Discriminator(
+            input_dim=num_amp_obs * 2,  # current + next
+            hidden_layer_sizes=self.discriminator_cfg.get("hidden_dims", [1024, 512]),
+            reward_scale=float(self.discriminator_cfg.get("reward_scale", 1.0)),
+            device=self.device,
+            loss_type=self.discriminator_cfg.get("loss_type", "BCEWithLogits"),
+        ).to(self.device)
+
+        # -------- 算法 --------
+        algo_name = self.runner_cfg.get("algorithm_class_name", self.alg_cfg.get("class_name", "AMP_PPO"))
+        if algo_name != "AMP_PPO":
+            print(f"[AMPOnPolicyRunner] Algorithm '{algo_name}' not supported; falling back to 'AMP_PPO'.")
+        raw_algo_kwargs = {k: v for k, v in self.alg_cfg.items() if k != "class_name"}
+        allowed = set(inspect.signature(AMP_PPO.__init__).parameters.keys()) - {"self"}
+        algo_kwargs = {k: v for k, v in raw_algo_kwargs.items() if k in allowed}
+        dropped = sorted(set(raw_algo_kwargs) - set(algo_kwargs))
+        if dropped:
+            print(f"[AMPOnPolicyRunner] Dropped unsupported AMP_PPO args: {dropped}")
+
+        self.alg: AMP_PPO = AMP_PPO(
+            actor_critic=self.actor_critic,
             discriminator=self.discriminator,
             amp_data=amp_data,
             amp_normalizer=self.amp_normalizer,
             device=self.device,
-            **self.alg_cfg,
+            **algo_kwargs,
         )
-        self.num_steps_per_env = self.cfg["num_steps_per_env"]
-        self.save_interval = self.cfg["save_interval"]
-        self.empirical_normalization = self.cfg["empirical_normalization"]
+
+        # -------- rollout/日志 --------
+        self.num_steps_per_env = int(self.runner_cfg.get("num_steps_per_env", 24))
+        self.save_interval = int(self.runner_cfg.get("save_interval", 50))
+        self.empirical_normalization = bool(self.runner_cfg.get("empirical_normalization", False))
+
         if self.empirical_normalization:
-            self.obs_normalizer = EmpiricalNormalization(
-                shape=[num_obs], until=1.0e8
-            ).to(self.device)
-            self.critic_obs_normalizer = EmpiricalNormalization(
-                shape=[num_critic_obs], until=1.0e8
-            ).to(self.device)
+            self.obs_normalizer = EmpiricalNormalization(shape=[num_actor_obs], until=1.0e8).to(self.device)
+            self.critic_obs_normalizer = EmpiricalNormalization(shape=[num_critic_obs], until=1.0e8).to(self.device)
         else:
-            self.obs_normalizer = torch.nn.Identity()  # no normalization
-            self.critic_obs_normalizer = torch.nn.Identity()  # no normalization
-        # init storage and model
+            self.obs_normalizer = torch.nn.Identity()
+            self.critic_obs_normalizer = torch.nn.Identity()
+
+        # 存储初始化
         self.alg.init_storage(
             self.env.num_envs,
             self.num_steps_per_env,
-            [num_obs],
+            [num_actor_obs],
             [num_critic_obs],
-            [self.env.num_actions],
+            [num_actions],
         )
 
-        # Log
+        # 日志
         self.log_dir = log_dir
         self.writer = None
         self.tot_timesteps = 0
@@ -224,176 +224,169 @@ class AMPOnPolicyRunner:
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
 
-    def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
-        # initialize writer
-        if self.log_dir is not None and self.writer is None:
-            # Launch either Tensorboard or Neptune & Tensorboard summary writer(s), default: Tensorboard.
-            self.logger_type = self.cfg.get("logger", "tensorboard")
-            self.logger_type = self.logger_type.lower()
+    # ----------------- 训练循环 -----------------
 
+    def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
+        # 初始化 writer
+        if self.log_dir is not None and self.writer is None:
             if self.logger_type == "neptune":
                 from rsl_rl.utils.neptune_utils import NeptuneSummaryWriter
-
-                self.writer = NeptuneSummaryWriter(
-                    log_dir=self.log_dir, flush_secs=10, cfg=self.cfg
-                )
-                self.writer.log_config(
-                    self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg
-                )
+                self.writer = NeptuneSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
+                self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
             elif self.logger_type == "wandb":
                 from rsl_rl.utils.wandb_utils import WandbSummaryWriter
                 import wandb
-
-                # Update the run name with a sequence number. This function is useful to
-                # replicate the same behaviour of rsl-rl-lib before v2.3.0
+                self.writer = WandbSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
+                # 可选：自动编号
                 def update_run_name_with_sequence(prefix: str) -> None:
-                    # Retrieve the current wandb run details (project and entity)
                     project = wandb.run.project
                     entity = wandb.run.entity
-
-                    # Use wandb's API to list all runs in your project
                     api = wandb.Api()
                     runs = api.runs(f"{entity}/{project}")
-
                     max_num = 0
-                    # Iterate through runs to extract the numeric suffix after the prefix.
                     for run in runs:
                         if run.name.startswith(prefix):
-                            # Extract the numeric part from the run name.
-                            numeric_suffix = run.name[
-                                len(prefix) :
-                            ]  # e.g., from "prefix564", get "564"
+                            numeric_suffix = run.name[len(prefix):]
                             try:
                                 run_num = int(numeric_suffix)
-                                if run_num > max_num:
-                                    max_num = run_num
+                                max_num = max(max_num, run_num)
                             except ValueError:
                                 continue
-
-                    # Increment to get the new run number
-                    new_num = max_num + 1
-                    new_run_name = f"{prefix}{new_num}"
-
-                    # Update the wandb run's name
-                    wandb.run.name = new_run_name
+                    wandb.run.name = f"{prefix}{max_num + 1}"
                     print("Updated run name to:", wandb.run.name)
-
-                self.writer = WandbSummaryWriter(
-                    log_dir=self.log_dir, flush_secs=10, cfg=self.cfg
-                )
-                update_run_name_with_sequence(prefix=self.cfg["wandb_project"])
-
+                if "wandb_project" in self.cfg:
+                    update_run_name_with_sequence(prefix=self.cfg["wandb_project"])
                 wandb.gym.monitor()
-                self.writer.log_config(
-                    self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg
-                )
-            elif self.logger_type == "tensorboard":
-                self.writer = TensorboardSummaryWriter(
-                    log_dir=self.log_dir, flush_secs=10
-                )
+                self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
             else:
-                raise AssertionError("logger type not found")
+                self.writer = TensorboardSummaryWriter(log_dir=self.log_dir, flush_secs=10)
 
-        if init_at_random_ep_len:
-            self.env.episode_length_buf = torch.randint_like(
-                self.env.episode_length_buf, high=int(self.env.max_episode_length)
-            )
-        obs, extras = self.env.get_observations()
-        amp_obs = extras["observations"]["amp"]
-        critic_obs = extras["observations"].get("critic", obs)
-        obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
+        # 随机化 episode 起点
+        if init_at_random_ep_len and hasattr(self.env, "episode_length_buf") and hasattr(self.env, "max_episode_length"):
+            self.env.episode_length_buf = torch.randint_like(self.env.episode_length_buf, high=int(self.env.max_episode_length))
+
+        # 初始观测
+        obs, priv = _unpack_env_observations(self.env)
+        critic_obs = priv if isinstance(priv, torch.Tensor) else obs
+
+        # 初始化 AMP 观测：默认取前 num_amp_obs 维
+        num_amp_obs = int(self.amp_cfg.get("num_amp_obs", obs.shape[-1]))
+        amp_obs = self._build_amp_obs_from_obs(obs, num_amp_obs)
+
+        obs = self.obs_normalizer(obs).to(self.device)
+        critic_obs = self.critic_obs_normalizer(critic_obs).to(self.device)
         amp_obs = amp_obs.to(self.device)
-        self.train_mode()  # switch to train mode (for dropout for example)
 
-        ep_infos = []
+        self.train_mode()
+
+        ep_infos: List[Dict[str, Any]] = []
         rewbuffer = deque(maxlen=100)
         lenbuffer = deque(maxlen=100)
-        cur_reward_sum = torch.zeros(
-            self.env.num_envs, dtype=torch.float, device=self.device
-        )
-        cur_episode_length = torch.zeros(
-            self.env.num_envs, dtype=torch.float, device=self.device
-        )
+        cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
+
         for it in range(start_iter, tot_iter):
             start = time.time()
-            # Rollout
-
-            mean_style_reward_log = 0
-            mean_task_reward_log = 0
+            mean_style_reward_log = 0.0
+            mean_task_reward_log = 0.0
 
             with torch.inference_mode():
-                for i in range(self.num_steps_per_env):
+                for _ in range(self.num_steps_per_env):
+                    # 策略动作
                     actions = self.alg.act(obs, critic_obs)
+                    # AMP：缓存当前 amp_obs
                     self.alg.act_amp(amp_obs)
-                    obs, rewards, dones, infos = self.env.step(actions)
-                    _, extras = self.env.get_observations()
-                    next_amp_obs = extras["observations"]["amp"]
-                    obs = self.obs_normalizer(obs)
-                    if "critic" in infos["observations"]:
-                        critic_obs = self.critic_obs_normalizer(
-                            infos["observations"]["critic"]
-                        )
-                    else:
-                        critic_obs = obs
-                    obs, critic_obs, rewards, dones = (
-                        obs.to(self.device),
-                        critic_obs.to(self.device),
-                        rewards.to(self.device),
-                        dones.to(self.device),
-                    )
+
+                    # 环境推进（兼容 7 元组 / 4 元组）
+                    step_ret = self.env.step(actions)
+                    obs_next, priv_next, rewards, dones, infos, term_ids, term_priv = _unpack_env_step(step_ret)
+
+                    # 选取 critic 下一帧
+                    critic_next = priv_next if isinstance(priv_next, torch.Tensor) else obs_next
+
+                    # 构建 next_amp_obs
+                    next_amp_obs = self._build_amp_obs_from_obs(obs_next, num_amp_obs)
+
+                    # 归一化 & 设备
+                    obs_next = self.obs_normalizer(obs_next).to(self.device)
+                    critic_next = self.critic_obs_normalizer(critic_next).to(self.device)
+                    rewards = rewards.to(self.device)
+                    dones = dones.to(self.device)
                     next_amp_obs = next_amp_obs.to(self.device)
 
-                    # Process the AMP reward
-                    style_rewards = self.discriminator.predict_reward(
-                        amp_obs, next_amp_obs, normalizer=self.amp_normalizer
-                    )
+                    # 判别器风格奖励
+                    style_rewards = self.discriminator.predict_reward(amp_obs, next_amp_obs, normalizer=self.amp_normalizer)
 
                     mean_task_reward_log += rewards.mean().item()
                     mean_style_reward_log += style_rewards.mean().item()
 
-                    # Combine the task and style rewards (TODO this can be a hyperparameters)
+                    # 混合总奖励
                     rewards = 0.5 * rewards + 0.5 * style_rewards
 
+                    # 存入算法缓存
                     self.alg.process_env_step(rewards, dones, infos)
                     self.alg.process_amp_step(next_amp_obs)
 
-                    # The next observation becomes the current observation for the next step
+                    # 终止修正（若有）
+                    if term_ids is not None and term_priv is not None:
+                        term_ids = term_ids.to(self.device)
+                        term_priv = term_priv.to(self.device)
+                        critic_fixed = critic_next.clone().detach()
+                        critic_fixed[term_ids] = term_priv.clone().detach()
+                        critic_next = critic_fixed
+
+                    # 滚动到下一步
+                    obs = obs_next
+                    critic_obs = critic_next
                     amp_obs = torch.clone(next_amp_obs)
 
+                    # 训练日志
                     if self.log_dir is not None:
-                        # Book keeping
-                        # note: we changed logging to use "log" instead of "episode" to avoid confusion with
-                        # different types of logging data (rewards, curriculum, etc.)
-                        if "episode" in infos:
+                        if isinstance(infos, dict) and "episode" in infos:
                             ep_infos.append(infos["episode"])
-                        elif "log" in infos:
-                            ep_infos.append(infos["log"])
                         cur_reward_sum += rewards
                         cur_episode_length += 1
                         new_ids = (dones > 0).nonzero(as_tuple=False)
-                        rewbuffer.extend(
-                            cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist()
-                        )
-                        lenbuffer.extend(
-                            cur_episode_length[new_ids][:, 0].cpu().numpy().tolist()
-                        )
-                        cur_reward_sum[new_ids] = 0
-                        cur_episode_length[new_ids] = 0
+                        if new_ids.numel() > 0:
+                            rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                            lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
+                            cur_reward_sum[new_ids] = 0
+                            cur_episode_length[new_ids] = 0
 
                 stop = time.time()
                 collection_time = stop - start
 
-                # Learning step
+                # 学习步骤
                 start = stop
                 self.alg.compute_returns(critic_obs)
 
-            mean_style_reward_log /= self.num_steps_per_env
-            mean_task_reward_log /= self.num_steps_per_env
-            mean_total_reward_log = mean_style_reward_log + mean_task_reward_log
+            # --- Update step（返回值长度自适应） ---
+            
+            update_out = self.alg.update()
+            if not isinstance(update_out, (list, tuple)):
+                raise RuntimeError(f"Unexpected update() return type: {type(update_out)}")
 
+            vals = list(update_out)
+            KEYS = [
+                "mean_value_loss",
+                "mean_surrogate_loss",
+                "mean_amp_loss",
+                "mean_grad_pen_loss",
+                "mean_policy_pred",
+                "mean_expert_pred",
+                "mean_accuracy_policy",
+                "mean_accuracy_expert",
+                "mean_kl_divergence",
+                "mean_swap_loss",
+                "mean_actor_sym_loss",
+                "mean_critic_sym_loss",
+            ]
+            if len(vals) < len(KEYS):
+                vals += [0.0] * (len(KEYS) - len(vals))
+            vals = vals[:len(KEYS)]
             (
                 mean_value_loss,
                 mean_surrogate_loss,
@@ -404,27 +397,56 @@ class AMPOnPolicyRunner:
                 mean_accuracy_policy,
                 mean_accuracy_expert,
                 mean_kl_divergence,
-            ) = self.alg.update()
+                mean_swap_loss,
+                mean_actor_sym_loss,
+                mean_critic_sym_loss,
+            ) = vals
+
             stop = time.time()
             learn_time = stop - start
             self.current_learning_iteration = it
-            if self.log_dir is not None:
-                self.log(locals())
-            if it % self.save_interval == 0:
-                self.save(os.path.join(self.log_dir, f"model_{it}.pt"), save_onnx=True)
-            ep_infos.clear()
-            if it == start_iter:
-                # obtain all the diff files
-                git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
-                # if possible store them to wandb
-                if self.logger_type in ["wandb", "neptune"] and git_file_paths:
-                    for path in git_file_paths:
-                        self.writer.save_file(path)
 
-        self.save(
-            os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"),
-            save_onnx=True,
-        )
+            # 记录
+            if self.log_dir is not None:
+                # 额外把 swap/symmetry 指标放入 locals 参与 log()
+                locals_to_log = locals().copy()
+                locals_to_log.update({
+                    "mean_swap_loss": mean_swap_loss,
+                    "mean_actor_sym_loss": mean_actor_sym_loss,
+                    "mean_critic_sym_loss": mean_critic_sym_loss
+                })
+                self.log(locals_to_log)
+
+            # 保存
+            if self.log_dir is not None and (it % self.save_interval == 0):
+                self.save(os.path.join(self.log_dir, f"model_{it}.pt"), save_onnx=True)
+
+            ep_infos.clear()
+            if it == start_iter and self.log_dir is not None:
+                # 记录代码状态
+                try:
+                    git_file_paths = store_code_state(self.log_dir, [rsl_rl.__file__])
+                    if self.logger_type in ["wandb", "neptune"] and git_file_paths:
+                        for path in git_file_paths:
+                            self.writer.save_file(path)
+                except Exception:
+                    pass
+
+        # 末次保存
+        if self.log_dir is not None:
+            self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"), save_onnx=True)
+
+    # ----------------- 日志/工具/保存 -----------------
+
+    def _build_amp_obs_from_obs(self, obs: torch.Tensor, num_amp_obs: int) -> torch.Tensor:
+        """
+        从 obs 构造 AMP 判别器输入：
+          - 默认取前 num_amp_obs 维；若维度不足则直接返回 obs
+        如你在 env 侧已有更精准的 AMP 特征，可在此替换为拼接的特征张量。
+        """
+        if obs.shape[-1] >= num_amp_obs:
+            return obs[..., :num_amp_obs]
+        return obs
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):
         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
@@ -436,7 +458,6 @@ class AMPOnPolicyRunner:
             for key in locs["ep_infos"][0]:
                 infotensor = torch.tensor([], device=self.device)
                 for ep_info in locs["ep_infos"]:
-                    # handle scalar and zero dimensional tensor infos
                     if key not in ep_info:
                         continue
                     if not isinstance(ep_info[key], torch.Tensor):
@@ -445,122 +466,73 @@ class AMPOnPolicyRunner:
                         ep_info[key] = ep_info[key].unsqueeze(0)
                     infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
                 value = torch.mean(infotensor)
-                # log to logger and terminal
                 if "/" in key:
                     self.writer.add_scalar(key, value, locs["it"])
                     ep_string += f"""{f'{key}:':>{pad}} {value:.4f}\n"""
                 else:
                     self.writer.add_scalar("Episode/" + key, value, locs["it"])
                     ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
-        mean_std = self.alg.actor_critic.std.mean()
-        fps = int(
-            self.num_steps_per_env
-            * self.env.num_envs
-            / (locs["collection_time"] + locs["learn_time"])
-        )
 
-        self.writer.add_scalar(
-            "Loss/value_function", locs["mean_value_loss"], locs["it"]
-        )
-        self.writer.add_scalar(
-            "Loss/surrogate", locs["mean_surrogate_loss"], locs["it"]
-        )
+        try:
+            mean_std = float(self.alg.actor_critic.std.mean().item())
+        except Exception:
+            mean_std = float("nan")
+        fps = int(self.num_steps_per_env * self.env.num_envs / (locs["collection_time"] + locs["learn_time"]))
 
-        # Adding logging due to AMP
+        self.writer.add_scalar("Loss/value_function", locs["mean_value_loss"], locs["it"])
+        self.writer.add_scalar("Loss/surrogate", locs["mean_surrogate_loss"], locs["it"])
         self.writer.add_scalar("Loss/amp_loss", locs["mean_amp_loss"], locs["it"])
-        self.writer.add_scalar(
-            "Loss/grad_pen_loss", locs["mean_grad_pen_loss"], locs["it"]
-        )
+        self.writer.add_scalar("Loss/grad_pen_loss", locs["mean_grad_pen_loss"], locs["it"])
         self.writer.add_scalar("Loss/policy_pred", locs["mean_policy_pred"], locs["it"])
         self.writer.add_scalar("Loss/expert_pred", locs["mean_expert_pred"], locs["it"])
-        self.writer.add_scalar(
-            "Loss/accuracy_policy", locs["mean_accuracy_policy"], locs["it"]
-        )
-        self.writer.add_scalar(
-            "Loss/accuracy_expert", locs["mean_accuracy_expert"], locs["it"]
-        )
-
+        self.writer.add_scalar("Loss/accuracy_policy", locs["mean_accuracy_policy"], locs["it"])
+        self.writer.add_scalar("Loss/accuracy_expert", locs["mean_accuracy_expert"], locs["it"])
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
-        self.writer.add_scalar(
-            "Loss/mean_kl_divergence", locs["mean_kl_divergence"], locs["it"]
-        )
-        self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
+        self.writer.add_scalar("Loss/mean_kl_divergence", locs["mean_kl_divergence"], locs["it"])
+        # 可选：兼容 HIMPPO 的对称性/交换损失（若没有则为 0）
+        self.writer.add_scalar("Loss/Swap Loss", locs.get("mean_swap_loss", 0.0), locs["it"])
+        self.writer.add_scalar("Loss/Actor Sym Loss", locs.get("mean_actor_sym_loss", 0.0), locs["it"])
+        self.writer.add_scalar("Loss/Critic Sym Loss", locs.get("mean_critic_sym_loss", 0.0), locs["it"])
+
+        self.writer.add_scalar("Policy/mean_noise_std", mean_std, locs["it"])
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
-        self.writer.add_scalar(
-            "Perf/collection time", locs["collection_time"], locs["it"]
-        )
+        self.writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
         self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
+
         if len(locs["rewbuffer"]) > 0:
-            self.writer.add_scalar(
-                "Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"]
-            )
-            self.writer.add_scalar(
-                "Train/mean_episode_length",
-                statistics.mean(locs["lenbuffer"]),
-                locs["it"],
-            )
-            self.writer.add_scalar(
-                "Train/mean_style_reward", locs["mean_style_reward_log"], locs["it"]
-            )
-            self.writer.add_scalar(
-                "Train/mean_task_reward", locs["mean_task_reward_log"], locs["it"]
-            )
-            if (
-                self.logger_type != "wandb"
-            ):  # wandb does not support non-integer x-axis logging
-                self.writer.add_scalar(
-                    "Train/mean_reward/time",
-                    statistics.mean(locs["rewbuffer"]),
-                    self.tot_time,
-                )
-                self.writer.add_scalar(
-                    "Train/mean_episode_length/time",
-                    statistics.mean(locs["lenbuffer"]),
-                    self.tot_time,
-                )
+            self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
+            self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
+            self.writer.add_scalar("Train/mean_style_reward", locs["mean_style_reward_log"], locs["it"])
+            self.writer.add_scalar("Train/mean_task_reward", locs["mean_task_reward_log"], locs["it"])
 
-        str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
-
+        # 终端打印
+        head = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
         if len(locs["rewbuffer"]) > 0:
             log_string = (
                 f"""{'#' * width}\n"""
-                f"""{str.center(width, ' ')}\n\n"""
-                f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
-                            'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
+                f"""{head.center(width, ' ')}\n\n"""
+                f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs['collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
                 f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
                 f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
-                f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
+                f"""{'Mean action noise std:':>{pad}} {mean_std:.2f}\n"""
                 f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
                 f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
             )
-            #   f"""{'Mean reward/step:':>{pad}} {locs['mean_reward']:.2f}\n"""
-            #   f"""{'Mean episode length/episode:':>{pad}} {locs['mean_trajectory_length']:.2f}\n""")
         else:
             log_string = (
                 f"""{'#' * width}\n"""
-                f"""{str.center(width, ' ')}\n\n"""
-                f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
-                            'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
+                f"""{head.center(width, ' ')}\n\n"""
+                f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs['collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
                 f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
                 f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
-                f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
+                f"""{'Mean action noise std:':>{pad}} {mean_std:.2f}\n"""
             )
-            #   f"""{'Mean reward/step:':>{pad}} {locs['mean_reward']:.2f}\n"""
-            #   f"""{'Mean episode length/episode:':>{pad}} {locs['mean_trajectory_length']:.2f}\n""")
-
         log_string += ep_string
 
-        # make the eta in H:M:S
-        eta_seconds = (
-            self.tot_time
-            / (locs["it"] + 1)
-            * (locs["num_learning_iterations"] - locs["it"])
-        )
-
-        # Convert seconds to H:M:S
+        # ETA 打印（友好格式）
+        eta_seconds = self.tot_time / (locs["it"] + 1) * (locs["num_learning_iterations"] - locs["it"])
         eta_h, rem = divmod(eta_seconds, 3600)
         eta_m, eta_s = divmod(rem, 60)
-
         log_string += (
             f"""{'-' * width}\n"""
             f"""{'Total timesteps:':>{pad}} {self.tot_timesteps}\n"""
@@ -580,68 +552,49 @@ class AMPOnPolicyRunner:
             "infos": infos,
         }
         if self.empirical_normalization:
-            saved_dict["obs_norm_state_dict"] = self.obs_normalizer.state_dict()
-            saved_dict["critic_obs_norm_state_dict"] = (
-                self.critic_obs_normalizer.state_dict()
-            )
+            saved_dict["obs_norm_state_dict"] = getattr(self, "obs_normalizer").state_dict()
+            saved_dict["critic_obs_norm_state_dict"] = getattr(self, "critic_obs_normalizer").state_dict()
         torch.save(saved_dict, path)
 
-        # Upload model to external logging service
         if self.logger_type in ["neptune", "wandb"]:
             self.writer.save_model(path, self.current_learning_iteration)
 
         if save_onnx:
-            # Save the model in ONNX format
-            # extract the folder path
             onnx_folder = os.path.dirname(path)
-
-            # extract the iteration number from the path. The path is expected to be in the format
-            # model_{iteration}.pt
             iteration = int(os.path.basename(path).split("_")[1].split(".")[0])
             onnx_model_name = f"policy_{iteration}.onnx"
-
             export_policy_as_onnx(
                 self.alg.actor_critic,
-                normalizer=self.obs_normalizer,
+                normalizer=self.obs_normalizer if hasattr(self, "obs_normalizer") else torch.nn.Identity(),
                 path=onnx_folder,
                 filename=onnx_model_name,
             )
-
             if self.logger_type in ["neptune", "wandb"]:
-                self.writer.save_model(
-                    os.path.join(onnx_folder, onnx_model_name),
-                    self.current_learning_iteration,
-                )
+                self.writer.save_model(os.path.join(onnx_folder, onnx_model_name), self.current_learning_iteration)
 
     def load(self, path, load_optimizer=True, weights_only=False):
-        loaded_dict = torch.load(
-            path, map_location=self.device, weights_only=weights_only
-        )
+        loaded_dict = torch.load(path, map_location=self.device, weights_only=weights_only)
         self.alg.actor_critic.load_state_dict(loaded_dict["model_state_dict"])
         self.alg.discriminator.load_state_dict(loaded_dict["discriminator_state_dict"])
         self.alg.amp_normalizer = loaded_dict["amp_normalizer"]
 
         if self.empirical_normalization:
             self.obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
-            self.critic_obs_normalizer.load_state_dict(
-                loaded_dict["critic_obs_norm_state_dict"]
-            )
-        if load_optimizer:
+            self.critic_obs_normalizer.load_state_dict(loaded_dict["critic_obs_norm_state_dict"])
+        if load_optimizer and "optimizer_state_dict" in loaded_dict:
             self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
         self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict["infos"]
 
     def get_inference_policy(self, device=None):
-        self.eval_mode()  # switch to evaluation mode (dropout for example)
+        self.eval_mode()
         if device is not None:
             self.alg.actor_critic.to(device)
         policy = self.alg.actor_critic.act_inference
-        if self.cfg["empirical_normalization"]:
-            if device is not None:
+        if self.runner_cfg.get("empirical_normalization", False):
+            if device is not None and hasattr(self, "obs_normalizer"):
                 self.obs_normalizer.to(device)
-            policy = lambda x: self.alg.actor_critic.act_inference(
-                self.obs_normalizer(x)
-            )  # noqa: E731
+            policy = lambda x: self.alg.actor_critic.act_inference(self.obs_normalizer(x))  # noqa: E731
         return policy
 
     def train_mode(self):

@@ -207,6 +207,7 @@ class TiV2RoughCfgPPO(LeggedRobotCfgPPO):
 
     class runner(LeggedRobotCfgPPO.runner):
         # policy_class_name = "ActorCritic"
+        runner_class_name = 'HIMOnPolicyRunner'
         policy_class_name = 'HIMActorCritic'
         algorithm_class_name = 'HIMPPO'
         max_iterations = 100000

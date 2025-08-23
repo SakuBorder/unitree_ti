@@ -1,9 +1,9 @@
 # legged_gym/envs/tiv2/ti_amp_env.py
-from legged_gym.envs.base.legged_robot import LeggedRobot
+from legged_gym.envs.tiv2.tiv2_env import TiV2Robot
 import torch
 from isaacgym.torch_utils import *
 
-class TiV2AMPRobot(LeggedRobot):
+class TiV2AMPRobot(TiV2Robot):  # 继承自TiV2Robot而不是LeggedRobot
     def __init__(self, cfg, sim_params, physics_engine, sim_device, headless):
         super().__init__(cfg, sim_params, physics_engine, sim_device, headless)
         
@@ -36,6 +36,13 @@ class TiV2AMPRobot(LeggedRobot):
         
         # 添加AMP观测到infos
         amp_obs = self.compute_amp_observations()
+        if "observations" not in infos:
+            infos["observations"] = {}
         infos["observations"]["amp"] = amp_obs
         
         return obs, privileged_obs, rewards, dones, infos, termination_ids, termination_obs
+    
+    # 如果TiV2Robot中没有定义_reward_alive，在这里添加
+    def _reward_alive(self):
+        """奖励存活"""
+        return torch.ones(self.num_envs, dtype=torch.float, device=self.device)

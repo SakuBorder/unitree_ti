@@ -70,6 +70,10 @@ class BaseTask():
 
     def get_observations(self):
         return self.obs_buf
+    # def get_observations(self):
+    #     # 兼容 Runner 需要的 (obs, extras) 签名
+    #     return self.obs_buf, self.extras
+
     
     def get_privileged_observations(self):
         return self.privileged_obs_buf
