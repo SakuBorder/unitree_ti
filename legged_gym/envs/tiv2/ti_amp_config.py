@@ -3,7 +3,7 @@ from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg, LeggedRobot
 
 class TiV2AMPCfg(LeggedRobotCfg):
     """TiV2 AMP Environment Configuration - 继承自 LeggedRobotCfg"""
-    
+
     class init_state(LeggedRobotCfg.init_state):
         pos = [0.0, 1.0, 0.95]  # x,y,z [m]
         default_joint_angles = {  # 与原TiV2保持一致
@@ -22,18 +22,19 @@ class TiV2AMPCfg(LeggedRobotCfg):
         }
 
     class env(LeggedRobotCfg.env):
-        num_actions = 12  # TiV2的DOF数量
+        num_actions = 12
         num_lower_dof = 12
-        # AMP特定的观测维度
-        num_amp_obs = 30  # joint_pos(12) + joint_vel(12) + base_lin_vel(3) + base_ang_vel(3)
-        
-        # 保持与原TiV2环境一致的观测结构
+
+        # AMP 观测维度：12(q) + 12(dq) + 3(v_base_local) + 3(w_base_local) = 30
+        num_amp_obs = 30
+
+        # 维度保持与现有栈一致（用于 282/50）
         num_one_step_observations = 2 * 12 + 11 + 12  # 47
         num_one_step_privileged_obs = num_one_step_observations + 3  # 50
         num_actor_history = 6
         num_critic_history = 1
-        num_observations = num_actor_history * num_one_step_observations
-        num_privileged_obs = num_critic_history * num_one_step_privileged_obs
+        num_observations = num_actor_history * num_one_step_observations  # 282
+        num_privileged_obs = num_critic_history * num_one_step_privileged_obs  # 50
 
     class viewer(LeggedRobotCfg.viewer):
         ref_env = 0
@@ -87,43 +88,45 @@ class TiV2AMPCfg(LeggedRobotCfg):
     class rewards(LeggedRobotCfg.rewards):
         soft_dof_pos_limit = 0.9
         base_height_target = 0.92
-        
+
         class scales(LeggedRobotCfg.rewards.scales):
-            # AMP特有奖励权重
+            # —— 保留“最小任务 + 安全/正则”的通用设置 ——
             tracking_lin_vel = 1.0
             tracking_ang_vel = 1.0
-            lin_vel_z = -2.0
-            ang_vel_xy = -0.5
-            orientation = -1.0
-            base_height = -100.0
-            dof_acc = -2.5e-7
-            feet_air_time = 0.0
-            collision = -1.0
             action_rate = -0.01
-            torques = 0.0
-            dof_pos_limits = -5.0
-            alive = 0.15
-            hip_pos = -10.0
-            ankle_pos = -50.0
-            feet_swing_height = -100.0
-            contact = 1.0
-            feet_parallel = -1.0
-            feet_heading_alignment = -1.0
-            lin_acc = -2.5e-5
-            contact_momentum = 2.5e-2
+            dof_pos_limits = -2.0
+            collision = -1.0
+            alive = 0.05
 
-    # AMP特定配置 - 统一使用正确路径
+            # —— 容易与风格冲突/或量级过大的项，先关闭（0.0）——
+            lin_vel_z = 0.0
+            ang_vel_xy = 0.0
+            orientation = 0.0
+            base_height = 0.0
+            dof_acc = 0.0
+            feet_air_time = 0.0
+            torques = 0.0
+            hip_pos = 0.0
+            ankle_pos = 0.0
+            feet_swing_height = 0.0
+            contact = 0.0
+            feet_parallel = 0.0
+            feet_heading_alignment = 0.0
+            lin_acc = 0.0
+            contact_momentum = 0.0
+
+    # 仅供环境内部使用的 AMP 可见配置（保持与 PPO 一致）
     class amp:
         amp_data_path = "/home/dy/dy/code/unitree_ti/data/ti512/v1/singles"
         dataset_names = ["0-Male2Walking_c3d_B9 -  Walk turn left 90_poses"]
         dataset_weights = [1.0]
         slow_down_factor = 1
-        num_amp_obs = 30  # 与env.num_amp_obs保持一致
-        dt = 1.0/60.0  # simulation timestep
-        decimation = 4  # 与control.decimation保持一致
+        num_amp_obs = 30
+        dt = 1.0/60.0
+        decimation = 4
         replay_buffer_size = 100000
         reward_scale = 2.0
-        joint_names = None  # 让AMPLoader自动推断
+        joint_names = None
 
     class observations:
         class amp:
@@ -135,11 +138,11 @@ class TiV2AMPCfg(LeggedRobotCfg):
 
 class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
     """TiV2 AMP PPO Training Configuration"""
-    
+
     class runner:
         runner_class_name = "AMPOnPolicyRunner"
         algorithm_class_name = "AMP_PPO"
-        policy_class_name = "ActorCriticMoE"  # 或者 "ActorCritic"
+        policy_class_name = "ActorCriticMoE"  # 或 "ActorCritic"
         experiment_name = "tiv2_amp"
         run_name = "tiv2_amp_run"
         resume = False
@@ -155,36 +158,35 @@ class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
         actor_hidden_dims = [512, 256, 128]
         critic_hidden_dims = [512, 256, 128]
         activation = 'elu'
-        # MoE特定参数（如果使用ActorCriticMoE）
+        # MoE 参数（仅在使用 ActorCriticMoE 时生效）
         num_experts = 4
-        gate_hidden_dims = None  # 使用默认值
+        gate_hidden_dims = None  # 使用默认
 
-    # AMP_PPO算法参数 - 严格按照AMP_PPO.__init__的签名
     class algorithm:
-        num_learning_epochs = 5  # 增加学习epochs
-        num_mini_batches = 4     # 增加mini-batch数量
+        # 与 AMP_PPO.__init__ 对齐
+        num_learning_epochs = 5
+        num_mini_batches = 4
         clip_param = 0.2
         gamma = 0.998
         lam = 0.95
         value_loss_coef = 1.0
-        entropy_coef = 0.01      # 增加探索
+        entropy_coef = 0.01
         learning_rate = 1e-3
         max_grad_norm = 1.0
         use_clipped_value_loss = True
-        schedule = "adaptive"    # 使用自适应学习率
+        schedule = "adaptive"
         desired_kl = 0.01
         amp_replay_buffer_size = 100000
         use_smooth_ratio_clipping = False
 
-    # 判别器配置
     class discriminator:
         hidden_dims = [1024, 512]
-        reward_scale = 2.0
+        reward_scale = 2.0  # 如需更强风格，可升到 5.0~10.0 再观察
         loss_type = "BCEWithLogits"
-        eta_wgan = 0.3  # 如果使用Wasserstein loss
+        eta_wgan = 0.3
         reward_clamp_epsilon = 1e-4
 
-    # AMP特定配置 - 与环境配置保持一致
+    # Runner 会从这里读取 AMP 相关项（含融合权重）
     class amp:
         amp_data_path = "/home/dy/dy/code/unitree_ti/data/ti512/v1/singles"
         dataset_names = ["0-Male2Walking_c3d_B9 -  Walk turn left 90_poses"]
@@ -194,5 +196,9 @@ class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
         dt = 1.0/60.0
         decimation = 4
         replay_buffer_size = 100000
-        reward_scale = 2.0
+        reward_scale = 2.0  # 这里保留同名字段无碍（Runner 只把它并入 amp_cfg）
         joint_names = None
+
+        # ★ 新增：任务/风格融合权重（Runner 中已支持）
+        style_weight = 0.5
+        task_weight  = 0.5

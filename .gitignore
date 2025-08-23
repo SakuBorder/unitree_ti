@@ -6,6 +6,8 @@ isaacgym/
 debug/
 logs/
 rl_amp/
+output/
+
 
 # 如果还有缓存或编译产物也可以一起加上
 __pycache__/

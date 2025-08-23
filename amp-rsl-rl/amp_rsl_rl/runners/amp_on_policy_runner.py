@@ -107,6 +107,17 @@ class AMPOnPolicyRunner:
         self.discriminator_cfg = dict(train_cfg.get("discriminator", {}))
         self.amp_cfg = _merge_amp_cfg(train_cfg)
 
+        # === 新增：读取奖励融合权重（默认 0.5/0.5，并归一化到和为 1） ===
+        self.task_w = float(self.amp_cfg.get("task_weight", 0.5))
+        self.style_w = float(self.amp_cfg.get("style_weight", 0.5))
+        _sum_w = self.task_w + self.style_w
+        if _sum_w <= 0.0:
+            # 兜底，避免除零或负权
+            self.task_w, self.style_w = 0.5, 0.5
+        else:
+            self.task_w /= _sum_w
+            self.style_w /= _sum_w
+
         # -------- 获取一帧观测维度 --------
         obs0, priv0 = _unpack_env_observations(self.env)
         if not isinstance(obs0, torch.Tensor):
@@ -226,6 +237,7 @@ class AMPOnPolicyRunner:
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
 
+
     # ----------------- 训练循环 -----------------
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
@@ -294,11 +306,12 @@ class AMPOnPolicyRunner:
                     # 判别器风格奖励
                     style_rewards = self.discriminator.predict_reward(amp_obs, next_amp_obs, normalizer=self.amp_normalizer)
 
+                    # 记录原始任务/风格奖励均值（仅用于日志）
                     mean_task_reward_log += rewards.mean().item()
                     mean_style_reward_log += style_rewards.mean().item()
 
-                    # 混合总奖励
-                    rewards = 0.5 * rewards + 0.5 * style_rewards
+                    # === 关键修改：使用配置权重进行融合 ===
+                    rewards = self.task_w * rewards + self.style_w * style_rewards
 
                     # 存入算法缓存
                     self.alg.process_env_step(rewards, dones, infos)
