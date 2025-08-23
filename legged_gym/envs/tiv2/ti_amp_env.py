@@ -1,120 +1,189 @@
 # legged_gym/envs/tiv2/ti_amp_env.py
 from legged_gym.envs.tiv2.tiv2_env import TiV2Robot
 import torch
-from isaacgym.torch_utils import *  # quat_rotate, quat_rotate_inverse, etc.
+from isaacgym.torch_utils import *  # quat_mul, quat_rotate, quat_rotate_inverse, etc.
 from isaacgym import gymtorch
 import torch.nn.functional as F
 from legged_gym.utils.isaacgym_utils import get_euler_xyz as get_euler_xyz_in_tensor
+from legged_gym.utils import torch_utils  # calc_heading_quat_inv, quat_to_tan_norm
 
 
 class TiV2AMPRobot(TiV2Robot):
     def __init__(self, cfg, sim_params, physics_engine, sim_device, headless):
         super().__init__(cfg, sim_params, physics_engine, sim_device, headless)
-        
-        # ===== 新增：AMP历史观测配置 =====
-        self._num_amp_obs_steps = getattr(cfg.env, 'num_amp_obs_steps', 2)  # 默认2步历史
-        self._num_amp_obs_per_step = self._get_amp_obs_per_step_dim()  # 单步AMP观测维度
-        self.num_amp_obs = self._num_amp_obs_steps * self._num_amp_obs_per_step  # 总AMP观测维度
-        
-        # 创建AMP观测历史缓冲区
+
+        # ===== AMP 历史观测配置（K 步）=====
+        self._num_amp_obs_steps = getattr(cfg.env, 'num_amp_obs_steps', 2)  # 历史步数 K
+
+        # —— 选择关键刚体（用于关键点位置）——
+        self._key_body_ids = self._select_key_body_ids()  # torch.long [K]
+
+        # —— 依 NVIDIA HumanoidAMP 对齐的单步维度：13 + dof_obs + dof_vel + 3*num_key_bodies
+        self._num_amp_obs_per_step = self._get_amp_obs_per_step_dim()  # 单步维度 D
+        self.num_amp_obs = self._num_amp_obs_steps * self._num_amp_obs_per_step  # 总维度 K*D
+
+        # 历史缓冲：[E, K, D]，其中索引 0 始终为“当前帧”
         self._amp_obs_buf = torch.zeros(
-            (self.num_envs, self._num_amp_obs_steps, self._num_amp_obs_per_step), 
-            device=self.device, dtype=torch.float
+            (self.num_envs, self._num_amp_obs_steps, self._num_amp_obs_per_step),
+            device=self.device, dtype=torch.float32
         )
-        self._curr_amp_obs_buf = self._amp_obs_buf[:, 0]  # 当前帧
-        self._hist_amp_obs_buf = self._amp_obs_buf[:, 1:]  # 历史帧
-        
+        self._curr_amp_obs_buf = self._amp_obs_buf[:, 0]   # [E, D]
+        self._hist_amp_obs_buf = self._amp_obs_buf[:, 1:]  # [E, K-1, D]
+
         self.amp_data = None  # 由 runner 注入
 
         # 确保 phase 属性存在
         if not hasattr(self, 'phase'):
             print("[TiV2AMPRobot] Adding missing 'phase' attribute")
-            self.phase = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
+            self.phase = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
 
         # 调试信息
         print(f"[TiV2AMPRobot] Actor obs dim: {self.num_obs}")
         print(f"[TiV2AMPRobot] Critic obs dim: {self.num_privileged_obs}")
-        print(f"[TiV2AMPRobot] AMP obs dim: {self.num_amp_obs} ({self._num_amp_obs_steps} steps × {self._num_amp_obs_per_step} per step)")
+        print(f"[TiV2AMPRobot] AMP obs dim: {self.num_amp_obs} "
+              f"({self._num_amp_obs_steps} steps × {self._num_amp_obs_per_step} per step, "
+              f"key_bodies={int(self._key_body_ids.numel())})")
+
+    # ---------------- Hook ----------------
 
     def set_amp_data(self, amp_data):
         """由 Runner 注入 AMPLoader 句柄"""
         self.amp_data = amp_data
 
+    # ---------------- AMP 观测构造（与 NVIDIA HumanoidAMP 对齐） ----------------
+
+    def _select_key_body_ids(self):
+        """选择用于 AMP 的关键刚体 id（相对根、再旋到 heading）。至少包含左右脚。"""
+        # 优先使用现有脚部索引（常见在 TiV2Robot 中设置）
+        if hasattr(self, "feet_indices") and self.feet_indices is not None and len(self.feet_indices) >= 2:
+            key_ids = list(self.feet_indices[:2].tolist())
+        else:
+            # 兜底：挑两个末端刚体（避免根 0）
+            last = max(1, self.num_bodies - 1)
+            key_ids = [max(1, last - 1), last]
+        return torch.as_tensor(key_ids, device=self.device, dtype=torch.long)
+
     def _get_amp_obs_per_step_dim(self):
-        """计算单步AMP观测维度：12 dof pos + 12 dof vel + 3 lin vel + 3 ang vel = 30"""
-        return self.num_dof * 2 + 3 + 3  # 30维
+        """
+        单步 AMP 观测维度（对齐 NVIDIA HumanoidAMP build_amp_observations）：
+          = 1(root_h) + 6(root_rot_tannorm) + 3(v_lin_local) + 3(v_ang_local)
+            + num_dof(dof_obs) + num_dof(dof_vel) + 3 * num_key_bodies(key_body_pos_local)
+          = 13 + 2*num_dof + 3*K
+        """
+        num_key_bodies = int(self._key_body_ids.numel()) if hasattr(self, "_key_body_ids") else 2
+        return 13 + 2 * self.num_dof + 3 * num_key_bodies
 
-    def _get_amp_obs_dim(self):
-        """保持向后兼容的接口"""
-        return self.num_amp_obs
+    def _dof_to_obs_identity(self, dof_pos: torch.Tensor) -> torch.Tensor:
+        """如果没有复杂的关节重排/压缩，直接返回 dof_pos 即可（与参考中的 dof_to_obs 对齐为恒等）。"""
+        return dof_pos
 
-    def _compute_amp_observations_single_step(self):
-        """计算当前帧的AMP观测（不包含历史）"""
-        base_lin_vel_local = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
-        base_ang_vel_local = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
+    def _compute_amp_observations_single_step(self) -> torch.Tensor:
+        """
+        对齐 NVIDIA: root_h, root_rot(tan-norm, heading 对齐), 局部 v/ω, dof_obs, dof_vel, key_body_pos_local
+        """
+        # 根状态（世界）
+        root_pos = self.root_states[:, 0:3]       # (E,3)
+        root_rot = self.root_states[:, 3:7]       # (E,4) xyzw
+        root_vel = self.root_states[:, 7:10]      # (E,3)
+        root_ang = self.root_states[:, 10:13]     # (E,3)
 
-        amp_obs = torch.cat([
-            self.dof_pos,           # 关节位置 (12)
-            self.dof_vel,           # 关节速度 (12)
-            base_lin_vel_local,     # 局部线速度 (3)
-            base_ang_vel_local,     # 局部角速度 (3)
-        ], dim=-1)  # 30 维
+        # 高度
+        root_h = root_pos[:, 2:3]                 # (E,1)
 
+        # heading 对齐（去掉航向）
+        heading_rot = torch_utils.calc_heading_quat_inv(root_rot)          # (E,4)
+        # 根姿态在 heading 坐标系下，再映射到 tan-norm（6维）
+        root_rot_local = quat_mul(heading_rot, root_rot)                    # (E,4)
+        root_rot_obs = torch_utils.quat_to_tan_norm(root_rot_local)         # (E,6)
+
+        # 局部线/角速度（heading 旋转）
+        local_root_vel     = quat_rotate(heading_rot, root_vel)             # (E,3)
+        local_root_ang_vel = quat_rotate(heading_rot, root_ang)             # (E,3)
+
+        # dof 到 obs（若无压缩，恒等）
+        dof_obs = self._dof_to_obs_identity(self.dof_pos)                   # (E,num_dof)
+        dof_vel = self.dof_vel                                              # (E,num_dof)
+
+        # 关键刚体相对根 + 旋到 heading
+        key_pos_world = self.rigid_body_states_view[:, self._key_body_ids, 0:3]  # (E,K,3)
+        rel_key = key_pos_world - root_pos.unsqueeze(1)                           # (E,K,3)
+
+        # 展平成 (E*K,3) 以复用 quat_rotate；heading 复制到 (E*K,4)
+        flat_rel = rel_key.reshape(-1, 3)
+        heading_rep = heading_rot.unsqueeze(1).expand(-1, rel_key.shape[1], -1).reshape(-1, 4)
+        local_key = quat_rotate(heading_rep, flat_rel).reshape(rel_key.shape)     # (E,K,3)
+        flat_local_key = local_key.reshape(local_key.shape[0], -1)                # (E, K*3)
+
+        # 拼接（顺序与参考一致）
+        amp_obs = torch.cat(
+            (root_h, root_rot_obs, local_root_vel, local_root_ang_vel, dof_obs, dof_vel, flat_local_key),
+            dim=-1
+        )  # (E, D)
         return amp_obs
 
     def _update_hist_amp_obs(self, env_ids=None):
-        """滚动更新AMP历史观测"""
+        """将历史右移一格，使 index 0 始终是“最新帧”"""
+        if self._num_amp_obs_steps <= 1:
+            return
         if env_ids is None:
-            # 更新所有环境
-            for i in reversed(range(self._amp_obs_buf.shape[1] - 1)):
-                self._amp_obs_buf[:, i + 1] = self._amp_obs_buf[:, i]
+            self._amp_obs_buf[:, 1:] = self._amp_obs_buf[:, :-1]
         else:
-            # 更新指定环境
-            for i in reversed(range(self._amp_obs_buf.shape[1] - 1)):
-                self._amp_obs_buf[env_ids, i + 1] = self._amp_obs_buf[env_ids, i]
+            self._amp_obs_buf[env_ids, 1:] = self._amp_obs_buf[env_ids, :-1]
 
     def _compute_amp_observations(self, env_ids=None):
-        """计算当前帧AMP观测并更新到缓冲区"""
+        """写入当前帧到 index=0"""
         if env_ids is None:
             self._curr_amp_obs_buf[:] = self._compute_amp_observations_single_step()
         else:
-            self._curr_amp_obs_buf[env_ids] = self._compute_amp_observations_single_step()[env_ids]
+            curr = self._compute_amp_observations_single_step()
+            self._curr_amp_obs_buf[env_ids] = curr[env_ids]
 
     def compute_amp_observations(self):
-        """对外接口：返回完整的AMP观测（包含历史）"""
-        return self._amp_obs_buf.view(-1, self.num_amp_obs)
+        """对外接口：返回 [E, K*D]"""
+        # 注意：reshape 而不是 view，避免错误展平
+        return self._amp_obs_buf.reshape(self.num_envs, self.num_amp_obs)
+
+    # ---------------- Env 生命周期 ----------------
 
     def post_physics_step(self):
-        """重写post_physics_step，添加AMP观测更新"""
-        # 先更新AMP观测历史（在父类逻辑之前）
+        """先执行父类物理步，再更新 AMP 历史与观测，并写入 extras。"""
+        # 1) 先让父类更新所有状态（root_states/rigid_body_states等）
+        ret = super().post_physics_step()
+
+        # 2) 再基于最新状态更新 AMP 历史 + 当前帧
         self._update_hist_amp_obs()
         self._compute_amp_observations()
-        
-        # 调用父类的post_physics_step，它应该正确处理终止逻辑
-        # 注意：我们直接调用LeggedRobot的post_physics_step，跳过TiV2Robot
-        return super(TiV2Robot, self).post_physics_step()
+
+        # 3) 扁平化并写入 extras（对齐常见AMP管线键名）
+        amp_obs_flat = self._amp_obs_buf.view(-1, self.num_amp_obs)
+
+        if not hasattr(self, "extras") or self.extras is None:
+            self.extras = {}
+        self.extras["amp_obs"] = amp_obs_flat  # 常见读取键
+        self.extras.setdefault("observations", {})
+        self.extras["observations"]["amp"] = amp_obs_flat  # 兼容你之前的读取方式
+
+        return ret
 
     def get_observations(self):
-        """重写 get_observations 以兼容 AMPOnPolicyRunner"""
+        """兼容 Runner：返回 (actor_obs, extras)"""
         try:
             super().compute_observations()
         except AttributeError as e:
             print(f"[Warning] Parent compute_observations failed: {e}")
             print("[Warning] Using observation buffers directly")
 
-        # 获取观测
         actor_obs = self.obs_buf
         critic_obs = self.privileged_obs_buf if self.privileged_obs_buf is not None else self.obs_buf
-        amp_obs = self.compute_amp_observations()  # 包含历史的AMP观测
+        amp_obs = self.compute_amp_observations()  # (E, K*D)
 
-        # 调试信息（仅第一次）
         if not hasattr(self, '_debug_printed'):
-            print(f"[Debug] Actor obs shape: {actor_obs.shape}")
-            print(f"[Debug] Critic obs shape: {critic_obs.shape}")
-            print(f"[Debug] AMP obs shape: {amp_obs.shape}")
+            print(f"[Debug] Actor obs shape:  {tuple(actor_obs.shape)}")
+            print(f"[Debug] Critic obs shape: {tuple(critic_obs.shape)}")
+            print(f"[Debug] AMP obs shape:    {tuple(amp_obs.shape)}")
             self._debug_printed = True
 
-        # 确保 critic_obs 维度正确
+        # 对齐 critic 维度
         if critic_obs.shape[-1] != self.num_privileged_obs:
             print(f"[Warning] Critic obs dim mismatch: got {critic_obs.shape[-1]}, expected {self.num_privileged_obs}")
             if critic_obs.shape[-1] > self.num_privileged_obs:
@@ -126,20 +195,17 @@ class TiV2AMPRobot(TiV2Robot):
                     dim=-1
                 )
 
-        # 构建 extras 字典
         extras = {
             "observations": {
                 "amp": amp_obs,
                 "critic": critic_obs
             }
         }
-
         return actor_obs, extras
 
     def step(self, actions):
-        """重写 step：保持返回7元组"""
+        """保持 7 元组返回"""
         ret = super().step(actions)
-
         if not isinstance(ret, tuple):
             raise RuntimeError(f"[TiV2AMPRobot.step] Unexpected return type from super().step: {type(ret)}")
 
@@ -155,7 +221,7 @@ class TiV2AMPRobot(TiV2Robot):
         else:
             raise RuntimeError(f"[TiV2AMPRobot.step] Unsupported super().step() signature with len={len(ret)}")
 
-        # 确保 privileged_obs 维度正确
+        # 对齐 privileged_obs 维度
         if privileged_obs is not None and privileged_obs.shape[-1] != self.num_privileged_obs:
             if privileged_obs.shape[-1] > self.num_privileged_obs:
                 privileged_obs = privileged_obs[..., :self.num_privileged_obs]
@@ -166,7 +232,7 @@ class TiV2AMPRobot(TiV2Robot):
                     dim=-1
                 )
 
-        # 把 critic 观测放到 infos，便于调试
+        # 调试：把 critic 放进 infos
         if isinstance(infos, dict):
             infos.setdefault("observations", {})
             infos["observations"]["critic"] = privileged_obs if privileged_obs is not None else obs
@@ -174,14 +240,13 @@ class TiV2AMPRobot(TiV2Robot):
         return obs, privileged_obs, rewards, dones, infos, termination_ids, termination_obs
 
     def get_privileged_observations(self):
-        """确保 privileged observations 返回正确维度"""
+        """确保返回的 privileged 维度正确"""
         try:
             priv_obs = super().get_privileged_observations()
         except AttributeError as e:
             print(f"[Warning] Parent get_privileged_observations failed: {e}")
-            priv_obs = self.privileged_obs_buf if hasattr(self, 'privileged_obs_buf') else None
+            priv_obs = getattr(self, 'privileged_obs_buf', None)
 
-        # 维度检查和修正
         if priv_obs is not None and priv_obs.shape[-1] != self.num_privileged_obs:
             if priv_obs.shape[-1] > self.num_privileged_obs:
                 priv_obs = priv_obs[..., :self.num_privileged_obs]
@@ -191,18 +256,17 @@ class TiV2AMPRobot(TiV2Robot):
                     [priv_obs, torch.zeros(priv_obs.shape[0], padding, device=priv_obs.device)],
                     dim=-1
                 )
-
         return priv_obs
 
     def compute_observations(self):
-        """重写父类的 compute_observations 以避免 phase 属性错误"""
+        """避免父类 phase 缺失导致异常"""
         try:
             super().compute_observations()
         except AttributeError as e:
             if "'phase'" in str(e):
                 print(f"[Warning] Phase attribute missing in parent compute_observations: {e}")
                 if not hasattr(self, 'phase'):
-                    self.phase = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
+                    self.phase = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
                 try:
                     super().compute_observations()
                 except Exception as e2:
@@ -211,12 +275,11 @@ class TiV2AMPRobot(TiV2Robot):
             else:
                 raise e
 
+    # ---------------- 其它与 TiV2 保持一致的回调 ----------------
+
     def _post_physics_step_callback(self):
-        """重新实现父类TiV2Robot的_post_physics_step_callback逻辑"""
-        # 更新足部状态
+        """来自 TiV2Robot 的回调逻辑（拷贝重写）"""
         self.update_feet_state()
-        
-        # 相位计算逻辑
         period = 0.8
         offset = 0.5
         self.phase = (self.episode_length_buf * self.dt) % period / period
@@ -225,37 +288,33 @@ class TiV2AMPRobot(TiV2Robot):
         self.leg_phase = torch.cat([self.phase_left.unsqueeze(1), self.phase_right.unsqueeze(1)], dim=-1)
 
     def update_feet_state(self):
-        """更新足部状态（来自TiV2Robot）"""
         self.gym.refresh_rigid_body_state_tensor(self.sim)
-
         self.feet_state = self.rigid_body_states_view[:, self.feet_indices, :]
         self.feet_pos = self.feet_state[:, :, :3]
         self.feet_vel = self.feet_state[:, :, 7:10]
         self.feet_rot = self.feet_state[:, :, 3:7]
-        self.feet_rpy[:,0] = get_euler_xyz_in_tensor(self.feet_rot[:,0])
-        self.feet_rpy[:,1] = get_euler_xyz_in_tensor(self.feet_rot[:,1])
+        self.feet_rpy[:, 0] = get_euler_xyz_in_tensor(self.feet_rot[:, 0])
+        self.feet_rpy[:, 1] = get_euler_xyz_in_tensor(self.feet_rot[:, 1])
         self.base_lin_acc = (self.root_states[:, 7:10] - self.last_root_vel[:, :3]) / self.dt
 
     def _reward_alive(self):
-        """奖励存活"""
-        return torch.ones(self.num_envs, dtype=torch.float, device=self.device)
+        return torch.ones(self.num_envs, dtype=torch.float32, device=self.device)
+
+    # ---------------- Reset & 历史初始化 ----------------
 
     def _init_amp_obs_for_reset(self, env_ids):
-        """为重置的环境初始化AMP观测历史"""
-        if len(env_ids) == 0:
+        """把当前帧复制到历史，形成 [当前|当前|...|当前]"""
+        if env_ids is None or len(env_ids) == 0:
             return
-            
-        # 计算当前帧观测
+        # 确保 index 0 已是“当前帧”
         self._compute_amp_observations(env_ids)
-        
-        # 将当前观测复制到所有历史帧（简单策略）
-        curr_amp_obs = self._curr_amp_obs_buf[env_ids].unsqueeze(-2)  # [N, 1, obs_dim]
-        self._hist_amp_obs_buf[env_ids] = curr_amp_obs.expand(-1, self._num_amp_obs_steps - 1, -1)
+
+        if self._num_amp_obs_steps > 1:
+            curr = self._curr_amp_obs_buf[env_ids].unsqueeze(1)  # [N,1,D]
+            self._hist_amp_obs_buf[env_ids] = curr.expand(-1, self._num_amp_obs_steps - 1, -1)
 
     def reset_idx(self, env_ids):
-        """
-        覆盖父类reset，添加专家帧热启动 + AMP历史初始化
-        """
+        """覆盖父类 reset：先父类复位，再可选专家热启动，最后初始化历史"""
         if not isinstance(env_ids, torch.Tensor):
             env_ids = torch.as_tensor(env_ids)
         env_ids = env_ids.to(self.device, dtype=torch.long).reshape(-1)
@@ -266,38 +325,33 @@ class TiV2AMPRobot(TiV2Robot):
         # 1) 父类复位
         super().reset_idx(env_ids)
 
-        # 2) 专家状态覆盖（如果有数据）
+        # 2) 专家状态覆盖（如有）
         if getattr(self, "amp_data", None) is not None:
             n = env_ids.numel()
             try:
                 quat_xyzw, qpos, qvel, vlin_local, vang_local = self.amp_data.get_state_for_reset(n)
-                
-                # 设备/精度对齐
+
                 todev = lambda t: t.to(device=self.device, dtype=torch.float32)
-                quat_xyzw  = todev(quat_xyzw)
+                quat_xyzw  = F.normalize(todev(quat_xyzw), dim=-1)
                 qpos       = todev(qpos)
                 qvel       = todev(qvel)
                 vlin_local = todev(vlin_local)
                 vang_local = todev(vang_local)
 
-                # 归一化四元数
-                quat_xyzw = torch.nn.functional.normalize(quat_xyzw, dim=-1)
-
-                # DOF维度对齐
+                # DOF 对齐
                 if qpos.shape[1] != self.num_dof:
                     if qpos.shape[1] > self.num_dof:
                         qpos = qpos[:, :self.num_dof]
                         qvel = qvel[:, :self.num_dof]
                     else:
                         pad = self.num_dof - qpos.shape[1]
-                        qpos = torch.nn.functional.pad(qpos, (0, pad))
-                        qvel = torch.nn.functional.pad(qvel, (0, pad))
+                        qpos = F.pad(qpos, (0, pad))
+                        qvel = F.pad(qvel, (0, pad))
 
-                # 局部→世界速度变换
+                # 局部 -> 世界速度
                 vlin_world = quat_rotate(quat_xyzw, vlin_local)
                 vang_world = quat_rotate(quat_xyzw, vang_local)
 
-                # 写入状态缓冲区
                 ids = env_ids.long()
                 self.root_states[ids, 3:7]   = quat_xyzw
                 self.root_states[ids, 7:10]  = vlin_world
@@ -316,7 +370,7 @@ class TiV2AMPRobot(TiV2Robot):
                     self.dof_state[ids, :, 0] = qpos
                     self.dof_state[ids, :, 1] = qvel
 
-                # push到仿真
+                # push 到仿真
                 try:
                     index_device = self.root_states.device
                     env_ids_i32 = env_ids.to(device=index_device, dtype=torch.int32)
@@ -327,7 +381,6 @@ class TiV2AMPRobot(TiV2Robot):
                         gymtorch.unwrap_tensor(env_ids_i32),
                         env_ids_i32.numel(),
                     )
-
                     if hasattr(self, "dof_state") and self.dof_state.ndim == 3:
                         self.gym.set_dof_state_tensor_indexed(
                             self.sim,
@@ -337,44 +390,45 @@ class TiV2AMPRobot(TiV2Robot):
                         )
                 except Exception as e:
                     print(f"[TiV2AMPRobot] Warning: failed to push AMP reset to sim: {e}")
-                    
+
             except Exception as e:
                 print(f"[TiV2AMPRobot] Warning: get_state_for_reset failed ({e}), fallback to default reset.")
 
-        # 3) 初始化AMP观测历史
+        # 3) 刷新张量并初始化历史
+        try:
+            self.gym.refresh_actor_root_state_tensor(self.sim)
+            self.gym.refresh_dof_state_tensor(self.sim)
+        except Exception:
+            pass
+
         self._init_amp_obs_for_reset(env_ids)
 
-    # ===== 新增：支持从专家数据构建AMP观测demo（用于判别器训练）=====
+    # ---------------- Demo 提取（可选） ----------------
+
     def fetch_amp_obs_demo(self, num_samples):
         """
-        从专家数据采样AMP观测demo，用于判别器训练
-        返回形状: [num_samples, num_amp_obs_steps * obs_per_step]
+        从专家数据采样 AMP 观测 demo：返回 [N, K*D]。
+        注意：这里为简化示例，每步独立采样并拼接，严格时间一致的版本建议从 AMPLoader 的滑窗输出取样。
         """
         if self.amp_data is None:
-            # 如果没有专家数据，返回零张量
             return torch.zeros((num_samples, self.num_amp_obs), device=self.device)
-        
+
         try:
-            # 简化版本：直接从当前专家数据采样
-            # 更完整的实现需要考虑时间步长和历史构建
             demo_obs_list = []
             for _ in range(self._num_amp_obs_steps):
-                # 为每个时间步采样专家状态
                 quat_xyzw, qpos, qvel, vlin_local, vang_local = self.amp_data.get_state_for_reset(num_samples)
-                
-                # 构建单步AMP观测
-                demo_obs = torch.cat([
+                # 这里的单步与环境的一致：dof_pos + dof_vel + vlin_local + vang_local
+                demo = torch.cat([
                     qpos.to(self.device),
                     qvel.to(self.device),
                     vlin_local.to(self.device),
                     vang_local.to(self.device)
-                ], dim=-1)
-                demo_obs_list.append(demo_obs)
-            
-            # 堆叠成历史序列并展平
-            amp_obs_demo = torch.stack(demo_obs_list, dim=1)  # [num_samples, steps, obs_per_step]
-            return amp_obs_demo.view(num_samples, -1)  # [num_samples, total_obs]
-            
+                ], dim=-1)  # [N, D_env_simple]
+                demo_obs_list.append(demo)
+
+            amp_obs_demo = torch.stack(demo_obs_list, dim=1)  # [N, K, D_env_simple]
+            return amp_obs_demo.reshape(num_samples, -1)       # [N, K*D_env_simple]
+
         except Exception as e:
             print(f"[TiV2AMPRobot] Warning: fetch_amp_obs_demo failed ({e}), returning zeros")
             return torch.zeros((num_samples, self.num_amp_obs), device=self.device)

@@ -23,16 +23,23 @@ class TiV2AMPCfg(LeggedRobotCfg):
 
     class env(LeggedRobotCfg.env):
         num_actions = 12
-        num_lower_dof = 12
+        num_lower_dof = 12  # = num_dof
 
-        # ===== 新增：AMP历史配置 =====
-        num_amp_obs_steps = 2  # AMP观测历史步数（默认2步）
-        
-        # AMP观测维度：(12+12+3+3) × 2步 = 60维
-        num_amp_obs_per_step = 30  # 单步AMP观测维度
-        num_amp_obs = num_amp_obs_steps * num_amp_obs_per_step  # 总AMP观测维度
+        # ===== AMP 历史配置（与 HumanoidAMP 观测对齐）=====
+        # 单步 AMP 观测维度：
+        #   13 (root_h + root_rot_tannorm(6) + v_lin_local(3) + v_ang_local(3))
+        # + 2 * num_dof (dof_obs + dof_vel)
+        # + 3 * num_key_bodies (关键刚体相对根的局部位置；这里取左右脚=2)
+        # 对于 TiV2: num_dof=12, key_bodies=2 -> 13 + 24 + 6 = 43
+        num_amp_obs_per_step = 43
 
-        # 保持现有观测配置不变
+        # 历史步数 K（例如 2 表示拼接 [t, t-1]）
+        num_amp_obs_steps = 2
+
+        # 总 AMP 维度 = K * D
+        num_amp_obs = num_amp_obs_steps * num_amp_obs_per_step
+
+        # —— 其余观察量（与原环境保持不变）——
         num_one_step_observations = 2 * 12 + 11 + 12  # 47
         num_one_step_privileged_obs = num_one_step_observations + 3  # 50
         num_actor_history = 6
@@ -68,8 +75,8 @@ class TiV2AMPCfg(LeggedRobotCfg):
         foot_name = "ANKLE_R"
         penalize_contacts_on = ["HIP", "KNEE"]
         terminate_after_contacts_on = ["base_link"]
-        left_foot_name = "left_foot"
-        right_foot_name = "right_foot"
+        left_foot_name = "L_ANKLE_P_S"
+        right_foot_name = "R_ANKLE_P_S"
         self_collisions = 0
         flip_visual_attachments = False
 
@@ -121,10 +128,14 @@ class TiV2AMPCfg(LeggedRobotCfg):
 
     class observations:
         class amp:
+            # 这些开关用于表达我们构造的 AMP 分量（与 HumanoidAMP 对齐）
             joint_pos = True
             joint_vel = True
             base_lin_vel_local = True
             base_ang_vel_local = True
+            root_height = True
+            root_rot_tannorm = True
+            key_body_pos_local = True  # 默认选择左右脚
 
 
 class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
@@ -174,19 +185,23 @@ class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
         eta_wgan = 0.3
         reward_clamp_epsilon = 1e-4
 
-    # AMP配置
+    # ===== AMP 配置（与 env 完全对齐；不再手写旧维度）=====
     class amp:
         amp_data_path = "/home/dy/dy/code/unitree_ti/data/ti512/v1/singles"
         dataset_names = ["walk", "maikan"]
         dataset_weights = [0.2, 0.8]
         slow_down_factor = 1
-        
-        # ===== 更新：AMP观测配置 =====
-        num_amp_obs_steps = 2  # 历史步数
-        num_amp_obs = 60  # 30 × 2步
-        
-        dt = 1.0/60.0
+
+        # 历史步数 & 单步维度（与 env.env 段一致）
+        num_amp_obs_steps = TiV2AMPCfg.env.num_amp_obs_steps
+        num_amp_obs_per_step = TiV2AMPCfg.env.num_amp_obs_per_step  # = 43
+        # 总维度由上两者计算（供 Runner/Discriminator 使用）
+        num_amp_obs = num_amp_obs_steps * num_amp_obs_per_step
+
+        # 时序对齐（dt 与 decimation 给 Runner 兜底使用）
+        dt = 1.0 / 60.0
         decimation = 4
+
         replay_buffer_size = 100000
         reward_scale = 2.0
         joint_names = None

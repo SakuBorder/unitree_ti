@@ -35,7 +35,7 @@ except Exception:
 
 def _unpack_env_observations(env: VecEnv) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """
-    兼容以下两种形式：
+    兼容：
       - get_observations() -> obs
       - get_observations() -> (obs, extras)
     并尝试通过 env.get_privileged_observations() 获取 priv。
@@ -55,11 +55,9 @@ def _unpack_env_step(ret: Any) -> Tuple[
     torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor, Dict[str, Any], Optional[torch.Tensor], Optional[torch.Tensor]
 ]:
     """
-    将 env.step(...) 的返回统一解成：
+    统一解包 env.step(...)：
       (obs, priv, rewards, dones, infos, term_ids, term_priv)
-    支持：
-      - 7 元组: (obs, priv, rewards, dones, infos, termination_ids, termination_privileged_obs)
-      - 4 元组: (obs, rewards, dones, infos)
+    支持 7 元组与 4 元组。
     """
     if isinstance(ret, tuple):
         if len(ret) >= 7:
@@ -83,7 +81,8 @@ def _merge_amp_cfg(train_cfg: Dict[str, Any]) -> Dict[str, Any]:
     for k in (
         "amp_data_path", "dataset_names", "dataset_weights", "slow_down_factor",
         "num_amp_obs", "dt", "decimation", "replay_buffer_size", "reward_scale",
-        "joint_names"
+        "joint_names", "style_weight", "task_weight",
+        "num_amp_obs_steps", "history_steps", "history_stride"
     ):
         if k in train_cfg and k not in amp:
             amp[k] = train_cfg[k]
@@ -96,7 +95,7 @@ class AMPOnPolicyRunner:
     """
 
     def __init__(self, env: VecEnv, train_cfg, log_dir=None, device="cpu"):
-        from pathlib import Path  # ← 新增：用于目录扫描
+        from pathlib import Path
 
         self.env = env
         self.device = device
@@ -150,60 +149,63 @@ class AMPOnPolicyRunner:
 
         # -------- AMP 组件 --------
         # dt/decimation：优先从 env.cfg；取不到用 amp_cfg 兜底
-        dt = getattr(getattr(self.env, "cfg", None), "sim", None)
-        dt = getattr(dt, "dt", None)
-        decimation = getattr(getattr(self.env, "cfg", None), "control", None)
-        decimation = getattr(decimation, "decimation", None) or getattr(getattr(self.env, "cfg", None), "decimation", None)
+        dt_cfg = getattr(getattr(self.env, "cfg", None), "sim", None)
+        dt = getattr(dt_cfg, "dt", None)
+        deci_cfg = getattr(getattr(self.env, "cfg", None), "control", None)
+        decimation = getattr(deci_cfg, "decimation", None) or getattr(getattr(self.env, "cfg", None), "decimation", None)
         if dt is None:
             dt = float(self.amp_cfg.get("dt", 1.0 / 60.0))
         if decimation is None:
             decimation = int(self.amp_cfg.get("decimation", 1))
         delta_t = float(dt) * int(decimation)
 
-        num_amp_obs = int(self.amp_cfg.get("num_amp_obs", num_actor_obs))
-        joint_names = self.amp_cfg.get("joint_names", None)
+        # 优先使用环境提供的 AMP 维度（含历史），否则用 cfg 中的数值
+        num_amp_obs_env = getattr(self.env, "num_amp_obs", None)
+        num_amp_obs_cfg = self.amp_cfg.get("num_amp_obs", None)
+        num_amp_obs = int(num_amp_obs_env if num_amp_obs_env is not None else (num_amp_obs_cfg if num_amp_obs_cfg is not None else num_actor_obs))
 
+        # 历史窗口设置：优先 amp.num_amp_obs_steps 或 env._num_amp_obs_steps
+        history_steps = self.amp_cfg.get("history_steps", None)
+        if history_steps is None:
+            history_steps = self.amp_cfg.get("num_amp_obs_steps", None)
+        if history_steps is None:
+            history_steps = getattr(self.env, "_num_amp_obs_steps", 1)
+        history_stride = self.amp_cfg.get("history_stride", 1)
+
+        joint_names = self.amp_cfg.get("joint_names", None)
         amp_data_path = self.amp_cfg.get("amp_data_path", None)
         dataset_names = list(self.amp_cfg.get("dataset_names", []) or [])
         dataset_weights = list(self.amp_cfg.get("dataset_weights", []) or [])
         slow_down_factor = self.amp_cfg.get("slow_down_factor", 1)
 
-        # === 目录展开逻辑（关键修改） ===
-        # 场景：dataset_names = ["walk"] 且 amp_data_path = ".../singles"
-        # 若 singles/walk 是目录，则枚举其中所有文件，取 stem 作为数据集名，并保留子目录前缀 "walk/<stem>"
+        # === 目录展开逻辑 ===
         if amp_data_path is None:
             raise RuntimeError("AMP config requires 'amp_data_path'.")
-
         root = Path(amp_data_path)
+
         if len(dataset_names) == 1:
             maybe_dir = root / dataset_names[0]
             if maybe_dir.is_dir():
-                # 支持的文件后缀（可根据你的数据进行调整/增减）
                 exts = {".npy", ".npz", ".pt", ".pkl"}
                 files = [p for p in maybe_dir.iterdir() if p.is_file() and p.suffix in exts]
                 files.sort()
                 if len(files) == 0:
                     print(f"[AMP DATA] Warning: directory '{maybe_dir}' is empty or has no supported files {sorted(list(exts))}.")
-                # 产生形如 "walk/<stem>" 的名字，保持子目录结构
                 dataset_names = [f"{maybe_dir.name}/{p.stem}" for p in files]
-                # 权重对齐（未提供或长度不足则补 1.0）
                 if len(dataset_weights) != len(dataset_names):
                     dataset_weights = [1.0] * len(dataset_names)
                 print(f"[AMP DATA] Expanded directory '{maybe_dir}': {len(dataset_names)} files found.")
             elif not maybe_dir.exists():
-                # 若不是目录且也不存在同名文件/子目录，保留原样但给出提示
                 print(f"[AMP DATA] Note: '{maybe_dir}' not a directory; will treat '{dataset_names[0]}' as a single clip name.")
 
-        # 若权重还未对齐（例如 dataset_names 本来就是若干具体名字）
+        # 权重长度对齐
         if dataset_weights and len(dataset_weights) != len(dataset_names):
-            # 截断或补 1.0 以匹配长度
             if len(dataset_weights) > len(dataset_names):
                 dataset_weights = dataset_weights[:len(dataset_names)]
             else:
                 dataset_weights = dataset_weights + [1.0] * (len(dataset_names) - len(dataset_weights))
 
-        # 构造 AMPLoader
-        # 构造 AMPLoader
+        # 构造 AMPLoader（传入历史窗口参数）
         amp_data = AMPLoader(
             self.device,
             str(root),
@@ -212,6 +214,8 @@ class AMPOnPolicyRunner:
             delta_t,
             slow_down_factor,
             joint_names,
+            history_steps=history_steps,
+            history_stride=history_stride,
         )
         self.amp_data = amp_data  # 暴露供调试
 
@@ -219,7 +223,6 @@ class AMPOnPolicyRunner:
         if hasattr(self.env, "set_amp_data"):
             self.env.set_amp_data(self.amp_data)
         try:
-            # 用专家热启动覆盖一次（而不是等到第一步 dones 才覆盖）
             all_ids = torch.arange(self.env.num_envs, device=self.device, dtype=torch.long)
             if hasattr(self.env, "reset_idx"):
                 self.env.reset_idx(all_ids)
@@ -227,8 +230,6 @@ class AMPOnPolicyRunner:
                 self.env.reset()
         except Exception as e:
             print(f"[Runner] Soft-warn: initial AMP reset failed: {e}")
-
-
 
         # === AMP 数据摘要（打印 + 训练时写入 TensorBoard） ===
         def _get_attr_any(obj, names):
@@ -310,6 +311,7 @@ class AMPOnPolicyRunner:
             f"datasets: {datasets_line if datasets_line else '<none>'}\n"
             f"delta_t={delta_t:.6f}, decimation={decimation}, slow_down_factor={slow_down_factor}\n"
             f"num_amp_obs={num_amp_obs}, disc_input_dim={num_amp_obs * 2}\n"
+            f"history_steps={int(history_steps)}, history_stride={int(history_stride)}\n"
             f"estimated_pairs={pairs_txt}\n"
             f"per-dataset:\n{details_block}\n"
             f"sample_pairs preview: {sample_preview}"
@@ -381,9 +383,6 @@ class AMPOnPolicyRunner:
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
 
-
-
-
     # ----------------- 训练循环 -----------------
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
@@ -398,8 +397,8 @@ class AMPOnPolicyRunner:
         obs, priv = _unpack_env_observations(self.env)
         critic_obs = priv if isinstance(priv, torch.Tensor) else obs
 
-        # 初始化 AMP 观测：默认取前 num_amp_obs 维
-        num_amp_obs = int(self.amp_cfg.get("num_amp_obs", obs.shape[-1]))
+        # 初始化 AMP 观测（优先环境提供）
+        num_amp_obs = int(getattr(self.env, "num_amp_obs", self.amp_cfg.get("num_amp_obs", obs.shape[-1])))
         amp_obs = self._build_amp_obs_from_obs(obs, num_amp_obs)
 
         # 归一化/设备
@@ -418,12 +417,12 @@ class AMPOnPolicyRunner:
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
 
-        # [AMP DEBUG] 一次性 sanity 打印（第一个 iteration 之前）
+        # [AMP DEBUG] 一次性 sanity 打印
         print(f"[AMP DEBUG] Shapes | actor_obs={tuple(obs.shape)}, critic_obs={tuple(critic_obs.shape)}, amp_obs={tuple(amp_obs.shape)}")
         if hasattr(self.discriminator, "input_dim"):
             print(f"[AMP DEBUG] Discriminator input_dim={self.discriminator.input_dim} (should be 2*{num_amp_obs})")
 
-        # 将 AMP 数据摘要写入 TensorBoard（只写一次，global_step=0）
+        # AMP 数据摘要 -> TensorBoard
         if self.writer is not None and getattr(self, "_amp_data_text", None):
             self.writer.add_text("AMP/DataSummary", f"<pre>{self._amp_data_text}</pre>", 0)
 
@@ -439,7 +438,7 @@ class AMPOnPolicyRunner:
                     # AMP：缓存当前 amp_obs
                     self.alg.act_amp(amp_obs)
 
-                    # 环境推进（兼容 7 元组 / 4 元组）
+                    # 环境推进
                     step_ret = self.env.step(actions)
                     obs_next, priv_next, rewards, dones, infos, term_ids, term_priv = _unpack_env_step(step_ret)
 
@@ -463,7 +462,7 @@ class AMPOnPolicyRunner:
                     mean_task_reward_log += rewards.mean().item()
                     mean_style_reward_log += style_rewards.mean().item()
 
-                    # === 使用配置权重进行融合 ===
+                    # 融合奖励
                     rewards = self.task_w * rewards + self.style_w * style_rewards
 
                     # 存入算法缓存
@@ -478,7 +477,7 @@ class AMPOnPolicyRunner:
                         critic_fixed[term_ids] = term_priv.clone().detach()
                         critic_next = critic_fixed
 
-                    # 滚动到下一步
+                    # 滚动
                     obs = obs_next
                     critic_obs = critic_next
                     amp_obs = torch.clone(next_amp_obs)
@@ -545,7 +544,7 @@ class AMPOnPolicyRunner:
             learn_time = stop - start
             self.current_learning_iteration = it
 
-            # [AMP DEBUG] 每次迭代打印（前 3 次必打，之后每 100 次打一次）
+            # [AMP DEBUG] 前几次与每 100 次打印
             steps_this_iter = float(self.num_steps_per_env)
             mean_style_reward_avg = mean_style_reward_log / max(1.0, steps_this_iter)
             if (it < start_iter + 3) or (it % 100 == 0):
@@ -575,7 +574,6 @@ class AMPOnPolicyRunner:
 
             ep_infos.clear()
             if it == start_iter and self.log_dir is not None:
-                # 记录代码状态（失败则忽略）
                 try:
                     store_code_state(self.log_dir, [rsl_rl.__file__])
                 except Exception:
@@ -585,41 +583,48 @@ class AMPOnPolicyRunner:
         if self.log_dir is not None:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"), save_onnx=True)
 
-
     # ----------------- 日志/工具/保存 -----------------
 
     def _build_amp_obs_from_obs(self, obs: torch.Tensor, num_amp_obs: int) -> torch.Tensor:
         """
         正确构建AMP观测 - 优先使用环境提供的专用方法
         """
-        # 方法1: 优先使用环境的compute_amp_observations方法
+        # 方法1: 优先使用环境的compute_amp_observations方法（其内部已含历史）
         if hasattr(self.env, 'compute_amp_observations'):
             return self.env.compute_amp_observations()
 
-        # 方法2: 从环境状态重新构造（如果环境没有专用方法）
+        # 方法2: 从环境状态重新构造（降级为单步），保持维度 <= num_amp_obs
         try:
             from isaacgym.torch_utils import quat_rotate_inverse
-
-            # 确保环境有必要的属性
             if hasattr(self.env, 'dof_pos') and hasattr(self.env, 'dof_vel') and hasattr(self.env, 'base_quat') and hasattr(self.env, 'root_states'):
                 base_lin_vel_local = quat_rotate_inverse(self.env.base_quat, self.env.root_states[:, 7:10])
                 base_ang_vel_local = quat_rotate_inverse(self.env.base_quat, self.env.root_states[:, 10:13])
-
                 amp_obs = torch.cat([
-                    self.env.dof_pos,      # 关节位置 (12)
-                    self.env.dof_vel,      # 关节速度 (12)
-                    base_lin_vel_local,    # 局部线速度 (3)
-                    base_ang_vel_local,    # 局部角速度 (3)
+                    self.env.dof_pos,      # 关节位置
+                    self.env.dof_vel,      # 关节速度
+                    base_lin_vel_local,    # 局部线速度
+                    base_ang_vel_local,    # 局部角速度
                 ], dim=-1)
-
+                if amp_obs.shape[-1] != num_amp_obs:
+                    # 简单裁剪/零填充到指定维度
+                    if amp_obs.shape[-1] > num_amp_obs:
+                        amp_obs = amp_obs[..., :num_amp_obs]
+                    else:
+                        pad = num_amp_obs - amp_obs.shape[-1]
+                        amp_obs = torch.cat([amp_obs, torch.zeros(amp_obs.shape[0], pad, device=amp_obs.device)], dim=-1)
                 return amp_obs
-            else:
-                print("Warning: Environment missing required attributes for AMP observation construction")
-
         except Exception as e:
             print(f"Warning: Failed to construct AMP observations from environment state: {e}")
 
-        return obs
+        # 方法3：最后兜底用原 obs（并裁剪/填充）
+        amp_obs = obs
+        if amp_obs.shape[-1] != num_amp_obs:
+            if amp_obs.shape[-1] > num_amp_obs:
+                amp_obs = amp_obs[..., :num_amp_obs]
+            else:
+                pad = num_amp_obs - amp_obs.shape[-1]
+                amp_obs = torch.cat([amp_obs, torch.zeros(amp_obs.shape[0], pad, device=amp_obs.device)], dim=-1)
+        return amp_obs
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):
         # 统计
@@ -627,7 +632,7 @@ class AMPOnPolicyRunner:
         self.tot_time += locs["collection_time"] + locs["learn_time"]
         iteration_time = locs["collection_time"] + locs["learn_time"]
 
-        # Episode 标量写 TensorBoard，同时拼装 ep_string
+        # Episode 标量写 TensorBoard
         ep_string = ""
         if locs["ep_infos"]:
             for key in locs["ep_infos"][0]:
@@ -678,13 +683,11 @@ class AMPOnPolicyRunner:
         if len(locs["rewbuffer"]) > 0:
             self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
             self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
-            # 这里记录原始任务/风格奖励的“本迭代均值”（注意：是逐步累加的均值，而非融合后的总奖励）
             self.writer.add_scalar("Train/mean_style_reward", locs["mean_style_reward_log"], locs["it"])
             self.writer.add_scalar("Train/mean_task_reward", locs["mean_task_reward_log"], locs["it"])
 
-        # ---- 终端块打印（加入 AMP 行）----
+        # ---- 终端块打印 ----
         head = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
-        # AMP 的“每步风格奖励均值”，便于跟踪是否稳定>0
         steps_this_iter = float(self.num_steps_per_env)
         mean_style_reward_avg = locs["mean_style_reward_log"] / max(1.0, steps_this_iter)
 
@@ -724,8 +727,6 @@ class AMPOnPolicyRunner:
         )
         print(log_string)
 
-
-
     def save(self, path, infos=None, save_onnx=False):
         saved_dict = {
             "model_state_dict": self.alg.actor_critic.state_dict(),
@@ -742,7 +743,10 @@ class AMPOnPolicyRunner:
 
         if save_onnx:
             onnx_folder = os.path.dirname(path)
-            iteration = int(os.path.basename(path).split("_")[1].split(".")[0])
+            try:
+                iteration = int(os.path.basename(path).split("_")[1].split(".")[0])
+            except Exception:
+                iteration = self.current_learning_iteration
             onnx_model_name = f"policy_{iteration}.onnx"
             export_policy_as_onnx(
                 self.alg.actor_critic,

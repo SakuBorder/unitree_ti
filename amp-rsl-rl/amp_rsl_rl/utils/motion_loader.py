@@ -6,12 +6,16 @@
 from pathlib import Path
 from typing import List, Union, Tuple, Generator, Optional
 from dataclasses import dataclass
+import os
 import joblib
 
 import torch
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
 from scipy.interpolate import interp1d
+
+# === 与环境一致的四元数工具 ===
+from isaacgym.torch_utils import quat_rotate, quat_from_angle_axis, quat_mul
 
 
 def download_amp_dataset_from_hf(
@@ -23,15 +27,6 @@ def download_amp_dataset_from_hf(
     """
     Downloads AMP dataset files from Hugging Face and saves them to `destination_dir`.
     Ensures real file copies (not symlinks or hard links).
-
-    Args:
-        destination_dir (Path): Local directory to save the files.
-        robot_folder (str): Folder in the Hugging Face dataset repo to pull from.
-        files (list): List of filenames to download.
-        repo_id (str): Hugging Face repository ID. Default is "ami-iit/amp-dataset".
-
-    Returns:
-        List[str]: List of dataset names (without extension).
     """
     from huggingface_hub import hf_hub_download
 
@@ -61,34 +56,131 @@ def download_amp_dataset_from_hf(
     return dataset_names
 
 
+# =========================
+# 工具：与环境对齐的旋转处理
+# =========================
+
+def _calc_heading_quat_inv(q_xyzw: torch.Tensor) -> torch.Tensor:
+    """从四元数提取“朝向”（绕 z）并取逆，xyzw。"""
+    ref = torch.zeros_like(q_xyzw[..., :3])
+    ref[..., 0] = 1.0
+    dir_xy = quat_rotate(q_xyzw, ref)
+    heading = torch.atan2(dir_xy[..., 1], dir_xy[..., 0])
+    axis = torch.zeros_like(ref)
+    axis[..., 2] = 1.0
+    return quat_from_angle_axis(-heading, axis)
+
+def _quat_to_tan_norm(q_xyzw: torch.Tensor) -> torch.Tensor:
+    """把四元数表示成 6 维 tan-norm（旋转 x 轴、z 轴后拼接）。"""
+    ref_tan = torch.zeros_like(q_xyzw[..., :3]); ref_tan[..., 0] = 1.0
+    ref_norm = torch.zeros_like(q_xyzw[..., :3]); ref_norm[..., 2] = 1.0
+    tan  = quat_rotate(q_xyzw, ref_tan)
+    norm = quat_rotate(q_xyzw, ref_norm)
+    return torch.cat([tan, norm], dim=-1)  # (..., 6)
+
+def _build_amp_obs_per_step(
+    base_pos_world: torch.Tensor,      # (T, 3)
+    base_quat_xyzw: torch.Tensor,      # (T, 4)
+    base_lin_vel_world: torch.Tensor,  # (T, 3)
+    base_ang_vel_world: torch.Tensor,  # (T, 3)
+    dof_pos: torch.Tensor,             # (T, J)
+    dof_vel: torch.Tensor,             # (T, J)
+    key_body_pos_world: Optional[torch.Tensor],  # (T, K, 3) or None
+    expect_dof_obs_dim: int = 12,
+    expect_key_bodies: int = 2,
+) -> torch.Tensor:
+    """
+    与 Humanoid AMP 对齐的单步观测：
+      [root_h(1), root_rot_tan_norm(6), local_root_vel(3), local_root_ang_vel(3),
+       dof_obs(12), dof_vel(12), local_key_body_pos(3*K)] -> K=2 → 43 维
+    """
+    T = base_pos_world.shape[0]
+    device = base_pos_world.device
+    dtype  = base_pos_world.dtype
+
+    # 1) root_h
+    root_h = base_pos_world[:, 2:3]  # (T,1)
+
+    # 2) 根姿态做 heading 归一 → tan-norm(6)
+    heading_inv = _calc_heading_quat_inv(base_quat_xyzw)     # (T,4)
+    root_rot_local = quat_mul(heading_inv, base_quat_xyzw)   # (T,4)
+    root_rot_tan_norm = _quat_to_tan_norm(root_rot_local)    # (T,6)
+
+    # 3) 根速度旋到“朝向坐标系”
+    local_root_vel     = quat_rotate(heading_inv, base_lin_vel_world)   # (T,3)
+    local_root_ang_vel = quat_rotate(heading_inv, base_ang_vel_world)   # (T,3)
+
+    # 4) dof obs（取前 12 维，不足则补零）
+    if dof_pos.shape[1] >= expect_dof_obs_dim:
+        dof_obs = dof_pos[:, :expect_dof_obs_dim]
+        dof_vel_obs = dof_vel[:, :expect_dof_obs_dim]
+    else:
+        pad = expect_dof_obs_dim - dof_pos.shape[1]
+        dof_obs = torch.cat([dof_pos, torch.zeros(T, pad, device=device, dtype=dtype)], dim=-1)
+        dof_vel_obs = torch.cat([dof_vel, torch.zeros(T, pad, device=device, dtype=dtype)], dim=-1)
+
+    # 5) 关键体位：相对根 + 旋到朝向系 → 展平 (T, 3*K)，K=2 不足补零，多了裁剪
+    if key_body_pos_world is None or key_body_pos_world.numel() == 0:
+        local_key_flat = torch.zeros((T, 3 * expect_key_bodies), device=device, dtype=dtype)
+    else:
+        K = key_body_pos_world.shape[1]
+        root_pos_expand = base_pos_world.unsqueeze(1)                 # (T,1,3)
+        key_rel = key_body_pos_world - root_pos_expand                # (T,K,3)
+
+        heading_expand = heading_inv.unsqueeze(1).expand(-1, K, -1)   # (T,K,4)
+        key_rel_flat = key_rel.reshape(-1, 3)
+        heading_flat = heading_expand.reshape(-1, 4)
+        local_key = quat_rotate(heading_flat, key_rel_flat).reshape(T, K, 3)
+        local_key_flat = local_key.reshape(T, 3 * K)
+
+        if K < expect_key_bodies:
+            pad = (expect_key_bodies - K) * 3
+            local_key_flat = torch.cat([local_key_flat, torch.zeros(T, pad, device=device, dtype=dtype)], dim=-1)
+        elif K > expect_key_bodies:
+            local_key_flat = local_key_flat[:, : 3 * expect_key_bodies]
+
+    # 6) 拼接 43 维
+    obs = torch.cat([
+        root_h,
+        root_rot_tan_norm,
+        local_root_vel,
+        local_root_ang_vel,
+        dof_obs,
+        dof_vel_obs,
+        local_key_flat,
+    ], dim=-1)
+    return obs  # (T, 43)
+
+
 @dataclass
 class MotionData:
     """
     Data class representing motion data for humanoid agents.
 
-    Stores joint positions/velocities, base velocities (world/local), and base orientation (quaternion).
-    All arrays converted to torch.Tensor on `device`.
-
     Attributes (shapes by time T):
         - joint_positions: (T, J)
         - joint_velocities: (T, J)
+        - base_positions: (T, 3)                  <-- 新增，供 root_h 使用
         - base_lin_velocities_mixed: (T, 3)
         - base_ang_velocities_mixed: (T, 3)
         - base_lin_velocities_local: (T, 3)
         - base_ang_velocities_local: (T, 3)
-        - base_quat: (T, 4) quaternion in **xyzw** (保持与数据一致，避免隐式转换)
+        - base_quat: (T, 4) quaternion in **xyzw**
+        - key_body_positions_world: (T, K, 3) or None  <-- 可选
     """
 
     joint_positions: Union[torch.Tensor, np.ndarray]
     joint_velocities: Union[torch.Tensor, np.ndarray]
+    base_positions: Union[torch.Tensor, np.ndarray]
     base_lin_velocities_mixed: Union[torch.Tensor, np.ndarray]
     base_ang_velocities_mixed: Union[torch.Tensor, np.ndarray]
     base_lin_velocities_local: Union[torch.Tensor, np.ndarray]
     base_ang_velocities_local: Union[torch.Tensor, np.ndarray]
     base_quat: Union[Rotation, torch.Tensor, np.ndarray]
+    key_body_positions_world: Optional[Union[torch.Tensor, np.ndarray]] = None
     device: torch.device = torch.device("cpu")
 
-    # 可选的元信息容器（由 loader 填充）
+    # Optional metadata (filled by loader)
     _meta: Optional[dict] = None
     _group_idx: Optional[int] = None
     _path: Optional[Path] = None
@@ -102,6 +194,10 @@ class MotionData:
             self.joint_positions = to_tensor(self.joint_positions)
         if isinstance(self.joint_velocities, np.ndarray):
             self.joint_velocities = to_tensor(self.joint_velocities)
+
+        if isinstance(self.base_positions, np.ndarray):
+            self.base_positions = to_tensor(self.base_positions)
+
         if isinstance(self.base_lin_velocities_mixed, np.ndarray):
             self.base_lin_velocities_mixed = to_tensor(self.base_lin_velocities_mixed)
         if isinstance(self.base_ang_velocities_mixed, np.ndarray):
@@ -115,15 +211,20 @@ class MotionData:
             quat_xyzw = self.base_quat.as_quat()  # (T,4) xyzw
             self.base_quat = torch.tensor(quat_xyzw, device=self.device, dtype=torch.float32)
         elif isinstance(self.base_quat, np.ndarray):
-            # 保持为 xyzw（不做 wxyz 重排，训练已验证可用）
             if self.base_quat.shape[-1] == 4:
                 self.base_quat = torch.tensor(self.base_quat, device=self.device, dtype=torch.float32)
+
+        if self.key_body_positions_world is not None and isinstance(self.key_body_positions_world, np.ndarray):
+            self.key_body_positions_world = to_tensor(self.key_body_positions_world)
 
     def __len__(self) -> int:
         return self.joint_positions.shape[0]
 
     def get_amp_dataset_obs(self, indices: torch.Tensor) -> torch.Tensor:
-        """Concatenate AMP observation at given indices."""
+        """
+        旧版的 30 维/步；保留以兼容（不在 Loader 中使用）。
+        建议改用 Loader 内部的 _build_amp_obs_per_step。
+        """
         return torch.cat(
             (
                 self.joint_positions[indices],
@@ -135,7 +236,7 @@ class MotionData:
         )
 
     def get_state_for_reset(self, indices: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        """Return (quat, q, dq, v_lin_local, v_ang_local) at given indices."""
+        """Return (quat, q, dq, v_lin_local, v_ang_local) for env resets."""
         return (
             self.base_quat[indices],
             self.joint_positions[indices],
@@ -151,12 +252,12 @@ class MotionData:
 
 class AMPLoader:
     """
-    Loader/processor for AMP datasets supporting NPY (original) and PKL (retargeted).
+    Loader/processor for AMP datasets (NPY original, PKL retargeted).
 
-    Supports:
-      - dataset_names 可为“文件名（不含后缀）”或“目录名（组）”。目录下递归收集 .pkl/.npy
-      - 多组采样：按组的 dataset_weights 将权重均匀分摊到该组所有帧
-      - 详细打印：逐组/逐文件展示原始 fps/帧数与重采样后帧数
+    新增：每步 43 维 AMP 观测（与环境完全对齐）+ 历史滑窗（K 步）。
+    兼容接口：
+      - feed_forward_generator() 仍返回 (state, next_state) 形如 [B, K*D]
+      - get_state_for_reset() 仍返回单帧（用于环境复位）
     """
 
     def __init__(
@@ -168,14 +269,25 @@ class AMPLoader:
         simulation_dt: float,
         slow_down_factor: int,
         expected_joint_names: Union[List[str], None] = None,
+        history_steps: Optional[int] = None,
+        history_stride: Optional[int] = None,
     ) -> None:
         # 设备 / 路径
         self.device = torch.device(device) if isinstance(device, str) else device
         if isinstance(dataset_path_root, str):
             dataset_path_root = Path(dataset_path_root)
 
-        # ---------- 1) 解析 dataset_names：文件 或 目录（组） ----------
-        # expanded_items: [(group_idx, Path, 'pkl'|'npy'), ...]
+        # --- 历史窗口配置 ---
+        env_k = os.environ.get("AMP_HISTORY_STEPS")
+        env_s = os.environ.get("AMP_HISTORY_STRIDE")
+        self.history_steps = int(history_steps if history_steps is not None else (int(env_k) if env_k else 1))
+        self.history_stride = int(history_stride if history_stride is not None else (int(env_s) if env_s else 1))
+        if self.history_steps < 1:
+            self.history_steps = 1
+        if self.history_stride < 1:
+            self.history_stride = 1
+
+        # ---------- 1) 解析 dataset_names ----------
         expanded_items: List[Tuple[int, Path, str]] = []
         group_to_files: List[List[Tuple[Path, str]]] = []
 
@@ -240,7 +352,6 @@ class AMPLoader:
                 print(f"[AMPLoader] WARNING: failed to load {path}")
                 continue
 
-            # 附加一些用于打印的字段
             md._group_idx = g_idx
             md._path = Path(path)
             md._format = fmt
@@ -252,26 +363,98 @@ class AMPLoader:
         if not self.motion_data:
             raise ValueError("No valid motion data loaded")
 
-        # ---------- 4) 展平缓存（obs / next_obs / reset states） ----------
-        obs_list, next_obs_list, reset_states = [], [], []
+        # ---------- 4) 每文件构造“43 维/步”的观测，再按历史窗口拼接 ----------
+        per_file_obs: List[torch.Tensor] = []
+        per_file_states: List[torch.Tensor] = []
+
         for data in self.motion_data:
             T = len(data)
+            # 43 维/步
+            per_step = _build_amp_obs_per_step(
+                base_pos_world           = data.base_positions,
+                base_quat_xyzw           = data.base_quat,
+                base_lin_vel_world       = data.base_lin_velocities_mixed,
+                base_ang_vel_world       = data.base_ang_velocities_mixed,
+                dof_pos                  = data.joint_positions,
+                dof_vel                  = data.joint_velocities,
+                key_body_pos_world       = getattr(data, "key_body_positions_world", None),  # 可 None
+                expect_dof_obs_dim       = 12,
+                expect_key_bodies        = 2,
+            )  # [T, 43]
+            per_file_obs.append(per_step)
+
+            # reset 用的逐帧状态（与环境复位接口一致）
             idx = torch.arange(T, device=self.device)
-            obs = data.get_amp_dataset_obs(idx)
-            next_idx = torch.clamp(idx + 1, max=T - 1)
-            next_obs = data.get_amp_dataset_obs(next_idx)
-
-            obs_list.append(obs)
-            next_obs_list.append(next_obs)
-
             quat, jp, jv, blv, bav = data.get_state_for_reset(idx)
-            reset_states.append(torch.cat([quat, jp, jv, blv, bav], dim=1))
+            per_file_states.append(torch.cat([quat, jp, jv, blv, bav], dim=1))
 
-        self.all_obs = torch.cat(obs_list, dim=0)
-        self.all_next_obs = torch.cat(next_obs_list, dim=0)
-        self.all_states = torch.cat(reset_states, dim=0)
+        self.per_step_dim = int(per_file_obs[0].shape[1])  # -> 43
 
-        # ---------- 5) 组级采样权重 -> 每一帧 ----------
+        # 历史窗口：x_t, x_{t-1}, ...
+        all_obs_windows: List[torch.Tensor] = []
+        all_next_obs_windows: List[torch.Tensor] = []
+        window_counts_per_file: List[int] = []
+
+        K = self.history_steps
+        S = self.history_stride
+        for obs in per_file_obs:
+            T = obs.shape[0]
+            if T < 2:
+                window_counts_per_file.append(0)
+                continue
+
+            i_min = (K - 1) * S if K > 1 else 0
+            i_max = T - 2
+            if i_max < i_min:
+                window_counts_per_file.append(0)
+                continue
+
+            starts = torch.arange(i_min, i_max + 1, device=self.device)
+            inds_s  = torch.stack([starts - j * S for j in range(K)], dim=1)      # [N, K]
+            inds_sp = torch.stack([starts + 1 - j * S for j in range(K)], dim=1)  # [N, K]
+
+            win_s  = obs[inds_s].reshape(starts.shape[0], -1)   # [N, K*D]
+            win_sp = obs[inds_sp].reshape(starts.shape[0], -1)  # [N, K*D]
+
+            all_obs_windows.append(win_s)
+            all_next_obs_windows.append(win_sp)
+            window_counts_per_file.append(int(win_s.shape[0]))
+
+        if len(all_obs_windows) == 0:
+            # 回退：无窗口则单步
+            obs_list, next_obs_list, reset_states = [], [], []
+            for data in self.motion_data:
+                T = len(data)
+                idx = torch.arange(T, device=self.device)
+                obs = _build_amp_obs_per_step(
+                    data.base_positions, data.base_quat,
+                    data.base_lin_velocities_mixed, data.base_ang_velocities_mixed,
+                    data.joint_positions, data.joint_velocities,
+                    getattr(data, "key_body_positions_world", None),
+                    expect_dof_obs_dim=12, expect_key_bodies=2
+                )
+                next_idx = torch.clamp(idx + 1, max=T - 1)
+                next_obs = obs[next_idx]
+
+                obs_list.append(obs)
+                next_obs_list.append(next_obs)
+
+                quat, jp, jv, blv, bav = data.get_state_for_reset(idx)
+                reset_states.append(torch.cat([quat, jp, jv, blv, bav], dim=1))
+
+            self.all_obs = torch.cat(obs_list, dim=0)           # [M, 43]
+            self.all_next_obs = torch.cat(next_obs_list, dim=0) # [M, 43]
+            self.all_states = torch.cat(reset_states, dim=0)
+            self.sample_item_dim = int(self.all_obs.shape[1])   # 43
+            self.history_steps_effective = 1
+        else:
+            self.all_obs = torch.cat(all_obs_windows, dim=0)         # [M, K*43]
+            self.all_next_obs = torch.cat(all_next_obs_windows, dim=0)
+            self.all_states = torch.cat(per_file_states, dim=0)      # 逐帧复位池
+            self.sample_item_dim = int(self.all_obs.shape[1])        # K*43
+            self.history_steps_effective = K
+
+        # ---------- 5) 组级采样权重 -> 每一窗口 ----------
         num_groups = len(dataset_names)
         if len(dataset_weights) < num_groups:
             dataset_weights = list(dataset_weights) + [1.0] * (num_groups - len(dataset_weights))
@@ -281,32 +464,45 @@ class AMPLoader:
             group_weights = torch.ones_like(group_weights)
         group_weights = group_weights / group_weights.sum()
 
-        group_total_frames = torch.zeros(num_groups, dtype=torch.float64, device=self.device)
-        for L, g in zip(file_lengths, file_group_indices):
-            group_total_frames[g] += float(L)
+        file_weights_source = window_counts_per_file if len(all_obs_windows) > 0 else file_lengths
 
-        per_frame_chunks = []
-        for L, g in zip(file_lengths, file_group_indices):
-            if group_total_frames[g] > 0:
-                w_per_frame = (group_weights[g].double() / group_total_frames[g]).item()
+        group_total_units = torch.zeros(num_groups, dtype=torch.float64, device=self.device)
+        for units, g in zip(file_weights_source, file_group_indices):
+            group_total_units[g] += float(units)
+
+        per_unit_chunks = []
+        for units, g in zip(file_weights_source, file_group_indices):
+            if group_total_units[g] > 0 and units > 0:
+                w_per_unit = (group_weights[g].double() / group_total_units[g]).item()
             else:
-                w_per_frame = 0.0
-            per_frame_chunks.append(torch.full((L,), w_per_frame, dtype=torch.float64, device=self.device))
+                w_per_unit = 0.0
+            per_unit_chunks.append(torch.full((int(units),), w_per_unit, dtype=torch.float64, device=self.device))
 
-        per_frame = torch.cat(per_frame_chunks, dim=0)
-        per_frame = per_frame / per_frame.sum().clamp_min(1e-12)
-        self.per_frame_weights = per_frame.to(dtype=torch.float32)
+        if per_unit_chunks:
+            per_unit = torch.cat(per_unit_chunks, dim=0)
+            per_unit = per_unit / per_unit.sum().clamp_min(1e-12)
+        else:
+            per_unit = torch.ones((self.all_obs.shape[0],), dtype=torch.float64, device=self.device)
+            per_unit = per_unit / per_unit.sum().clamp_min(1e-12)
+
+        self.per_frame_weights = per_unit.to(dtype=torch.float32)
 
         # ---------- 6) 汇总打印 ----------
         print("[AMPLoader] Summary:")
+        kind = "windows" if self.history_steps_effective > 1 else "frames"
         for gi, name in enumerate(dataset_names):
             print(
                 f"  Group {gi} '{name}': weight={group_weights[gi].item():.3f}, "
-                f"frames={int(group_total_frames[gi].item())}"
+                f"{kind}={int(group_total_units[gi].item())}"
             )
-        print(f"  Total files: {len(self.motion_data)}, total frames: {int(group_total_frames.sum().item())}")
+        print(
+            f"  Total files: {len(self.motion_data)}, "
+            f"per-step dim D={self.per_step_dim}, "
+            f"history K={self.history_steps_effective}, "
+            f"sample dim={self.sample_item_dim} "
+            f"({self.history_steps_effective}*{self.per_step_dim if self.history_steps_effective>1 else self.sample_item_dim})"
+        )
 
-        # 详细按组与文件列出
         print("[AMPLoader] Detailed listing (per group & file):")
         root_str = str(dataset_path_root.resolve())
         for gi, name in enumerate(dataset_names):
@@ -461,17 +657,28 @@ class AMPLoader:
             resampled_base_orientations, simulation_dt, local=True
         )
 
+        # 可选关键体位（如数据中存在）
+        key_world = None
+        for k in ["key_body_positions_world", "keypoints_world", "keypoints"]:
+            if k in data:
+                try:
+                    key_world = self._resample_data_Rn(data[k], t_orig, t_new)  # (T,K,3)
+                except Exception:
+                    key_world = None
+                break
+
         md = MotionData(
             joint_positions=resampled_joint_positions,
             joint_velocities=resampled_joint_velocities,
+            base_positions=resampled_base_positions,
             base_lin_velocities_mixed=resampled_base_lin_vel_mixed,
             base_ang_velocities_mixed=resampled_base_ang_vel_mixed,
             base_lin_velocities_local=resampled_base_lin_vel_local,
             base_ang_velocities_local=resampled_base_ang_vel_local,
             base_quat=resampled_base_orientations,
+            key_body_positions_world=key_world,
             device=self.device,
         )
-        # 元信息
         md._meta = {
             "format": "npy",
             "orig_fps": float(data.get("fps", 30.0)),
@@ -578,17 +785,21 @@ class AMPLoader:
             "nij,nj->ni", np.transpose(Rmats, (0, 2, 1)), resampled_base_lin_vel_mixed
         )
 
+        # 关键体位：多数 retarget pkl 没有，缺省为 None（Loader 里会用零占位）
+        key_world = None
+
         md = MotionData(
             joint_positions=resampled_joint_positions,
             joint_velocities=resampled_joint_velocities,
+            base_positions=resampled_base_positions,
             base_lin_velocities_mixed=resampled_base_lin_vel_mixed,
             base_ang_velocities_mixed=resampled_base_ang_vel_mixed,
             base_lin_velocities_local=resampled_base_lin_vel_local,
             base_ang_velocities_local=resampled_base_ang_vel_local,
-            base_quat=resampled_base_orientations,  # 保持 xyzw 到张量
+            base_quat=resampled_base_orientations,  # xyzw -> tensor in __post_init__
+            key_body_positions_world=key_world,
             device=self.device,
         )
-        # 元信息
         md._meta = {
             "format": "pkl",
             "orig_fps": float(fps),
@@ -621,7 +832,7 @@ class AMPLoader:
     def feed_forward_generator(
         self, num_mini_batch: int, mini_batch_size: int
     ) -> Generator[Tuple[torch.Tensor, torch.Tensor], None, None]:
-        """Yield mini-batches of (state, next_state) pairs."""
+        """Yield mini-batches of (state, next_state) pairs. Shapes: [B, K*D]."""
         for _ in range(num_mini_batch):
             idx = torch.multinomial(self.per_frame_weights, mini_batch_size, replacement=True)
             yield self.all_obs[idx], self.all_next_obs[idx]
@@ -629,9 +840,7 @@ class AMPLoader:
     def get_state_for_reset(self, number_of_samples: int) -> Tuple[torch.Tensor, ...]:
         """
         Randomly sample full states for environment resets from the flat buffer.
-
-        Returns:
-            (quat, q, dq, v_lin_local, v_ang_local)
+        Returns: (quat, q, dq, v_lin_local, v_ang_local)
         """
         n = int(number_of_samples) if number_of_samples is not None else 0
         device = self.device
@@ -663,5 +872,16 @@ class AMPLoader:
             return empty_quat, empty_jpos, empty_jvel, empty_vlin, empty_vang
 
         idx = torch.multinomial(self.per_frame_weights, n, replacement=True)
-        full = self.all_states[idx]  # [n, 4 + J + J + 3 + 3]
+        # 注意：all_states 仍是“逐帧”的重置池，不受历史窗口影响
+        if not hasattr(self, "all_states") or self.all_states.numel() == 0:
+            empty_quat = torch.empty((n, 4), device=device, dtype=dtype)
+            empty_jpos = torch.empty((n, joint_dim), device=device, dtype=dtype)
+            empty_jvel = torch.empty((n, joint_dim), device=device, dtype=dtype)
+            empty_vlin = torch.empty((n, 3), device=device, dtype=dtype)
+            empty_vang = torch.empty((n, 3), device=device, dtype=dtype)
+            return empty_quat, empty_jpos, empty_jvel, empty_vlin, empty_vang
+
+        # 为避免索引越界（weights 对应窗口或帧），这里对 all_states 采用均匀采样
+        state_idx = torch.randint(0, self.all_states.shape[0], (n,), device=device)
+        full = self.all_states[state_idx]  # [n, 4 + J + J + 3 + 3]
         return torch.split(full, [4, joint_dim, joint_dim, 3, 3], dim=1)
