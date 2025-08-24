@@ -27,17 +27,17 @@ class TiV2AMPCfg(LeggedRobotCfg):
 
         # ===== AMP 历史配置（与 HumanoidAMP 观测对齐）=====
         # 单步 AMP 观测维度：
-        #   13 (root_h + root_rot_tannorm(6) + v_lin_local(3) + v_ang_local(3))
+        # 13 (root_h + root_rot_tannorm(6) + v_lin_local(3) + v_ang_local(3))
         # + 2 * num_dof (dof_obs + dof_vel)
         # + 3 * num_key_bodies (关键刚体相对根的局部位置；这里取左右脚=2)
         # 对于 TiV2: num_dof=12, key_bodies=2 -> 13 + 24 + 6 = 43
         num_amp_obs_per_step = 43
 
-        # 历史步数 K（例如 2 表示拼接 [t, t-1]）
-        num_amp_obs_steps = 2
+        # 历史步数 K：从 2 提到 6（更长时间窗，便于学节律）
+        num_amp_obs_steps = 6
 
         # 总 AMP 维度 = K * D
-        num_amp_obs = num_amp_obs_steps * num_amp_obs_per_step
+        num_amp_obs = num_amp_obs_steps * num_amp_obs_per_step  # 6 * 43 = 258
 
         # —— 其余观察量（与原环境保持不变）——
         num_one_step_observations = 2 * 12 + 11 + 12  # 47
@@ -70,11 +70,11 @@ class TiV2AMPCfg(LeggedRobotCfg):
             'ANKLE_R': 2,
             'ANKLE_P': 2
         }
-        # === 放大动作幅度，便于迈步 ===
-        action_scale = 0.25          # 原 0.12
+        # 放大动作幅度，便于迈步
+        action_scale = 0.25
         decimation = 4
 
-    # === 新增：明确非零速度指令范围（最关键） ===
+    # === 明确非零速度指令范围（让 tracking_* 真正生效） ===
     class commands(LeggedRobotCfg.commands):
         resampling_time = 8.0
         lin_vel_x = [-0.4, 1.0]      # m/s
@@ -113,26 +113,22 @@ class TiV2AMPCfg(LeggedRobotCfg):
         base_height_target = 0.92
 
         class scales(LeggedRobotCfg.rewards.scales):
-            # —— 任务项 —— 
+            # 任务项
             tracking_lin_vel = 1.0
             tracking_ang_vel = 1.0
 
-            # === 降低“动的惩罚”，避免站桩 ===
-            action_rate = -0.0002      # 原 -0.001
+            # 降低“动的惩罚”，避免站桩
+            action_rate = -0.0002
 
             dof_pos_limits = -2.0
             collision = -1.0
             alive = 0.05
 
-            # === 轻量步态 shaping，帮助迈出第一步 ===
-            # base_height = 0.1
-            # feet_air_time = 0.05
-            # contact = 0.05
-
             # 其余先关，避免与风格奖励冲突
             lin_vel_z = 0.0
             ang_vel_xy = 0.0
             orientation = 0.0
+            base_height = 0.0
             dof_acc = 0.0
             torques = 0.0
             hip_pos = 0.0
@@ -140,12 +136,14 @@ class TiV2AMPCfg(LeggedRobotCfg):
             feet_swing_height = 0.0
             feet_parallel = 0.0
             feet_heading_alignment = 0.0
+            feet_air_time = 0.0
+            contact = 0.0
             lin_acc = 0.0
             contact_momentum = 0.0
 
     class observations:
         class amp:
-            # 这些开关用于表达我们构造的 AMP 分量（与 HumanoidAMP 对齐）
+            # AMP 分量（与 HumanoidAMP 对齐）
             joint_pos = True
             joint_vel = True
             base_lin_vel_local = True
@@ -167,8 +165,8 @@ class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
         resume = False
         load_run = ".*"
         checkpoint = -1
-        # === 拉长 rollout，优势估计更稳 ===
-        num_steps_per_env = 32             # 原 24
+        # 拉长 rollout，优势估计更稳
+        num_steps_per_env = 32
         max_iterations = 100000
         save_interval = 500
         empirical_normalization = False
@@ -187,9 +185,9 @@ class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
         gamma = 0.998
         lam = 0.95
         value_loss_coef = 1.0
-        # === 鼓励探索，前期更容易动起来 ===
-        entropy_coef = 0.02              # 原 0.01
-        learning_rate = 8e-4             # 略降使训练更稳（可根据曲线再调）
+        # 鼓励探索，前期更容易动起来
+        entropy_coef = 0.02
+        learning_rate = 8e-4
         max_grad_norm = 1.0
         use_clipped_value_loss = True
         schedule = "adaptive"
@@ -213,10 +211,10 @@ class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
         slow_down_factor = 1
 
         # 历史步数 & 单步维度（与 env.env 段一致）
-        num_amp_obs_steps = TiV2AMPCfg.env.num_amp_obs_steps
+        num_amp_obs_steps = TiV2AMPCfg.env.num_amp_obs_steps  # = 6
         num_amp_obs_per_step = TiV2AMPCfg.env.num_amp_obs_per_step  # = 43
-        # 总维度由上两者计算（供 Runner/Discriminator 使用）
-        num_amp_obs = num_amp_obs_steps * num_amp_obs_per_step
+        # 总维度
+        num_amp_obs = num_amp_obs_steps * num_amp_obs_per_step  # 6 * 43 = 258
 
         # 时序对齐（dt 与 decimation 给 Runner 兜底使用）
         dt = 1.0 / 60.0
