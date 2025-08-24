@@ -125,10 +125,21 @@ class TiV2AMPRobot(TiV2Robot):
         """将历史右移一格，使 index 0 始终是“最新帧”"""
         if self._num_amp_obs_steps <= 1:
             return
+
         if env_ids is None:
-            self._amp_obs_buf[:, 1:] = self._amp_obs_buf[:, :-1]
+            # 克隆右侧源，避免与目标重叠
+            src = self._amp_obs_buf[:, :-1].clone()
+            self._amp_obs_buf[:, 1:] = src
         else:
-            self._amp_obs_buf[env_ids, 1:] = self._amp_obs_buf[env_ids, :-1]
+            # env_ids 可能是 LongTensor/ndarray/list；统一成 LongTensor
+            if not isinstance(env_ids, torch.Tensor):
+                env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+            else:
+                env_ids = env_ids.to(self.device, dtype=torch.long)
+
+            src = self._amp_obs_buf[env_ids, :-1].clone()
+            self._amp_obs_buf[env_ids, 1:] = src
+
 
     def _compute_amp_observations(self, env_ids=None):
         """写入当前帧到 index=0"""
@@ -147,23 +158,24 @@ class TiV2AMPRobot(TiV2Robot):
 
     def post_physics_step(self):
         """先执行父类物理步，再更新 AMP 历史与观测，并写入 extras。"""
-        # 1) 先让父类更新所有状态（root_states/rigid_body_states等）
         ret = super().post_physics_step()
 
-        # 2) 再基于最新状态更新 AMP 历史 + 当前帧
+        # 1) 先右移历史
         self._update_hist_amp_obs()
+        # 2) 写入当前帧到 index=0
         self._compute_amp_observations()
 
-        # 3) 扁平化并写入 extras（对齐常见AMP管线键名）
-        amp_obs_flat = self._amp_obs_buf.view(-1, self.num_amp_obs)
+        # 3) 扁平化并写入 extras（用 reshape 而不是 view，兼容非连续）
+        amp_obs_flat = self._amp_obs_buf.reshape(-1, self.num_amp_obs)
 
         if not hasattr(self, "extras") or self.extras is None:
             self.extras = {}
-        self.extras["amp_obs"] = amp_obs_flat  # 常见读取键
+        self.extras["amp_obs"] = amp_obs_flat
         self.extras.setdefault("observations", {})
-        self.extras["observations"]["amp"] = amp_obs_flat  # 兼容你之前的读取方式
+        self.extras["observations"]["amp"] = amp_obs_flat
 
         return ret
+
 
     def get_observations(self):
         """兼容 Runner：返回 (actor_obs, extras)"""

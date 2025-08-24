@@ -54,20 +54,32 @@ class TiV2AMPCfg(LeggedRobotCfg):
 
     class control(LeggedRobotCfg.control):
         control_type = 'P'
-        stiffness = {'HIP_P': 150,
-                     'HIP_R': 150,
-                     'HIP_Y': 150,
-                     'KNEE': 200,
-                     'ANKLE_R': 40,
-                     'ANKLE_P': 40}
-        damping = {'HIP_P': 2,
-                   'HIP_R': 2,
-                   'HIP_Y': 2,
-                   'KNEE': 4,
-                   'ANKLE_R': 2,
-                   'ANKLE_P': 2}
-        action_scale = 0.12
+        stiffness = {
+            'HIP_P': 150,
+            'HIP_R': 150,
+            'HIP_Y': 150,
+            'KNEE': 200,
+            'ANKLE_R': 40,
+            'ANKLE_P': 40
+        }
+        damping = {
+            'HIP_P': 2,
+            'HIP_R': 2,
+            'HIP_Y': 2,
+            'KNEE': 4,
+            'ANKLE_R': 2,
+            'ANKLE_P': 2
+        }
+        # === 放大动作幅度，便于迈步 ===
+        action_scale = 0.25          # 原 0.12
         decimation = 4
+
+    # === 新增：明确非零速度指令范围（最关键） ===
+    class commands(LeggedRobotCfg.commands):
+        resampling_time = 8.0
+        lin_vel_x = [-0.4, 1.0]      # m/s
+        lin_vel_y = [-0.3, 0.3]      # m/s
+        ang_vel_yaw = [-1.0, 1.0]    # rad/s
 
     class asset(LeggedRobotCfg.asset):
         file = '/home/dy/dy/code/unitree_ti/assert/ti5/tai5_12dof_no_limit.urdf'
@@ -101,26 +113,31 @@ class TiV2AMPCfg(LeggedRobotCfg):
         base_height_target = 0.92
 
         class scales(LeggedRobotCfg.rewards.scales):
-            # —— 最小任务 + 安全/正则 ——
+            # —— 任务项 —— 
             tracking_lin_vel = 1.0
             tracking_ang_vel = 1.0
-            action_rate = -0.001
+
+            # === 降低“动的惩罚”，避免站桩 ===
+            action_rate = -0.0002      # 原 -0.001
+
             dof_pos_limits = -2.0
             collision = -1.0
             alive = 0.05
 
-            # —— 先关闭，避免与风格冲突 ——
+            # === 轻量步态 shaping，帮助迈出第一步 ===
+            # base_height = 0.1
+            # feet_air_time = 0.05
+            # contact = 0.05
+
+            # 其余先关，避免与风格奖励冲突
             lin_vel_z = 0.0
             ang_vel_xy = 0.0
             orientation = 0.0
-            base_height = 0.0
             dof_acc = 0.0
-            feet_air_time = 0.0
             torques = 0.0
             hip_pos = 0.0
             ankle_pos = 0.0
             feet_swing_height = 0.0
-            contact = 0.0
             feet_parallel = 0.0
             feet_heading_alignment = 0.0
             lin_acc = 0.0
@@ -150,7 +167,8 @@ class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
         resume = False
         load_run = ".*"
         checkpoint = -1
-        num_steps_per_env = 24
+        # === 拉长 rollout，优势估计更稳 ===
+        num_steps_per_env = 32             # 原 24
         max_iterations = 100000
         save_interval = 500
         empirical_normalization = False
@@ -169,8 +187,9 @@ class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
         gamma = 0.998
         lam = 0.95
         value_loss_coef = 1.0
-        entropy_coef = 0.01
-        learning_rate = 1e-3
+        # === 鼓励探索，前期更容易动起来 ===
+        entropy_coef = 0.02              # 原 0.01
+        learning_rate = 8e-4             # 略降使训练更稳（可根据曲线再调）
         max_grad_norm = 1.0
         use_clipped_value_loss = True
         schedule = "adaptive"
@@ -188,8 +207,9 @@ class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
     # ===== AMP 配置（与 env 完全对齐；不再手写旧维度）=====
     class amp:
         amp_data_path = "/home/dy/dy/code/unitree_ti/data/ti512/v1/singles"
-        dataset_names = ["walk", "maikan"]
-        dataset_weights = [0.2, 0.8]
+        # 先纯走路起步，走稳后再把 maikan 加回来
+        dataset_names = ["walk"]
+        dataset_weights = [1.0]
         slow_down_factor = 1
 
         # 历史步数 & 单步维度（与 env.env 段一致）
@@ -206,6 +226,6 @@ class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
         reward_scale = 2.0
         joint_names = None
 
-        # 任务/风格融合权重
-        style_weight = 0.05
-        task_weight = 0.95
+        # 任务/风格融合权重（若在 runner 里使用）
+        style_weight = 0.2
+        task_weight = 0.8
