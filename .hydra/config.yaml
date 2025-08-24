@@ -6,7 +6,7 @@ robot:
   humanoid_type: ti512
   asset:
     assetRoot: /home/dy/dy/code/unitree_ti/assert/ti5/
-    assetFileName: /home/dy/dy/code/unitree_ti/assert/ti5/ti.xml
+    assetFileName: /home/dy/dy/code/unitree_ti/assert/ti5/ti5_12dof.xml
     urdfFileName: tai5_12dof_no_limit.urdf
   base_link: base_link
   body_names:

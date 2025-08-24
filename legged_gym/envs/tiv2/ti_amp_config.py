@@ -2,10 +2,10 @@
 from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg, LeggedRobotCfgPPO
 
 class TiV2AMPCfg(LeggedRobotCfg):
-    """TiV2 AMP Environment Configuration - 继承自 LeggedRobotCfg"""
+    """TiV2 AMP Environment Configuration - 阶段A（纯风格）"""
 
     class init_state(LeggedRobotCfg.init_state):
-        pos = [0.0, 1.0, 0.95]  # x,y,z [m]
+        pos = [0.0, 1.0, 0.95]
         default_joint_angles = {
             'L_ANKLE_R': 0.,
             'R_ANKLE_R': 0,
@@ -25,21 +25,13 @@ class TiV2AMPCfg(LeggedRobotCfg):
         num_actions = 12
         num_lower_dof = 12  # = num_dof
 
-        # ===== AMP 历史配置（与 HumanoidAMP 观测对齐）=====
-        # 单步 AMP 观测维度：
-        # 13 (root_h + root_rot_tannorm(6) + v_lin_local(3) + v_ang_local(3))
-        # + 2 * num_dof (dof_obs + dof_vel)
-        # + 3 * num_key_bodies (关键刚体相对根的局部位置；这里取左右脚=2)
+        # ===== AMP 历史配置（与 HumanoidAMP 对齐）=====
         # 对于 TiV2: num_dof=12, key_bodies=2 -> 13 + 24 + 6 = 43
         num_amp_obs_per_step = 43
-
-        # 历史步数 K：从 2 提到 6（更长时间窗，便于学节律）
         num_amp_obs_steps = 6
+        num_amp_obs = num_amp_obs_steps * num_amp_obs_per_step  # 258
 
-        # 总 AMP 维度 = K * D
-        num_amp_obs = num_amp_obs_steps * num_amp_obs_per_step  # 6 * 43 = 258
-
-        # —— 其余观察量（与原环境保持不变）——
+        # 原环境观察量
         num_one_step_observations = 2 * 12 + 11 + 12  # 47
         num_one_step_privileged_obs = num_one_step_observations + 3  # 50
         num_actor_history = 6
@@ -70,16 +62,22 @@ class TiV2AMPCfg(LeggedRobotCfg):
             'ANKLE_R': 2,
             'ANKLE_P': 2
         }
-        # 放大动作幅度，便于迈步
         action_scale = 0.25
         decimation = 4
 
-    # === 明确非零速度指令范围（让 tracking_* 真正生效） ===
+    # ===== 阶段A：命令恒定，episode 内不变 =====
     class commands(LeggedRobotCfg.commands):
-        resampling_time = 8.0
-        lin_vel_x = [-0.4, 1.0]      # m/s
-        lin_vel_y = [-0.3, 0.3]      # m/s
-        ang_vel_yaw = [-1.0, 1.0]    # rad/s
+        # 这些范围在阶段A里不会被用来重采样，但保留字段以兼容父类
+        resampling_time = 1e9  # 实际冻结；父类若读取也不会触发
+        lin_vel_x = [0.8, 0.8]
+        lin_vel_y = [0.0, 0.0]
+        ang_vel_yaw = [0.0, 0.0]
+
+        # 供 TiV2AMPRobot 读取的常量（可改）
+        phaseA_vx = 0.8
+        phaseA_vy = 0.0
+        phaseA_yaw = 0.0
+        # 如需改成原地踏步，可设 phaseA_vx=0.0
 
     class asset(LeggedRobotCfg.asset):
         file = '/home/dy/dy/code/unitree_ti/assert/ti5/tai5_12dof_no_limit.urdf'
@@ -93,38 +91,38 @@ class TiV2AMPCfg(LeggedRobotCfg):
         flip_visual_attachments = False
 
     class domain_rand(LeggedRobotCfg.domain_rand):
+        # 阶段A建议适度随机化；如不稳定可先减弱
         randomize_friction = True
         friction_range = [0.1, 1.25]
         randomize_base_mass = True
         added_mass_range = [-0.1, 2.]
         randomize_kp = True
-        kp_factor_range = [0.8, 1.2]
+        kp_factor_range = [0.9, 1.1]
         randomize_kd = True
-        kd_factor_range = [0.8, 1.2]
+        kd_factor_range = [0.9, 1.1]
         randomize_initial_joint_pos = True
-        initial_joint_pos_scale = [0.8, 1.2]
-        initial_joint_pos_offset = [-0.1, 0.1]
+        initial_joint_pos_scale = [0.9, 1.1]
+        initial_joint_pos_offset = [-0.05, 0.05]
         push_robots = True
         push_interval_s = 5
-        max_push_vel_xy = 0.5
+        max_push_vel_xy = 0.3
 
     class rewards(LeggedRobotCfg.rewards):
         soft_dof_pos_limit = 0.9
         base_height_target = 0.92
 
         class scales(LeggedRobotCfg.rewards.scales):
-            # 任务项
-            tracking_lin_vel = 1.0
-            tracking_ang_vel = 1.0
+            # 任务项全部关闭（阶段A）
+            tracking_lin_vel = 0.0
+            tracking_ang_vel = 0.0
 
-            # 降低“动的惩罚”，避免站桩
+            # 轻度约束，防止“奇怪但像”的姿态
             action_rate = -0.0002
-
             dof_pos_limits = -2.0
             collision = -1.0
             alive = 0.05
 
-            # 其余先关，避免与风格奖励冲突
+            # 其它保持关闭，避免与风格奖励冲突
             lin_vel_z = 0.0
             ang_vel_xy = 0.0
             orientation = 0.0
@@ -154,18 +152,17 @@ class TiV2AMPCfg(LeggedRobotCfg):
 
 
 class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
-    """TiV2 AMP PPO Training Configuration"""
+    """TiV2 AMP PPO Training Configuration - 阶段A（纯风格）"""
 
     class runner:
         runner_class_name = "AMPOnPolicyRunner"
         algorithm_class_name = "AMP_PPO"
-        policy_class_name = "ActorCritic"   # 或 "ActorCritic" “ActorCriticMoE”
-        experiment_name = "tiv2_amp"
-        run_name = "tiv2_amp_run"
+        policy_class_name = "ActorCritic"
+        experiment_name = "tiv2_amp_phaseA"
+        run_name = "tiv2_amp_phaseA_run"
         resume = False
         load_run = ".*"
         checkpoint = -1
-        # 拉长 rollout，优势估计更稳
         num_steps_per_env = 32
         max_iterations = 100000
         save_interval = 500
@@ -185,7 +182,6 @@ class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
         gamma = 0.998
         lam = 0.95
         value_loss_coef = 1.0
-        # 鼓励探索，前期更容易动起来
         entropy_coef = 0.02
         learning_rate = 8e-4
         max_grad_norm = 1.0
@@ -202,21 +198,17 @@ class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
         eta_wgan = 0.3
         reward_clamp_epsilon = 1e-4
 
-    # ===== AMP 配置（与 env 完全对齐；不再手写旧维度）=====
+    # ===== AMP 配置（阶段A：纯风格）=====
     class amp:
         amp_data_path = "/home/dy/dy/code/unitree_ti/data/ti512/v1/singles"
-        # 先纯走路起步，走稳后再把 maikan 加回来
         dataset_names = ["walk"]
         dataset_weights = [1.0]
         slow_down_factor = 1
 
-        # 历史步数 & 单步维度（与 env.env 段一致）
-        num_amp_obs_steps = TiV2AMPCfg.env.num_amp_obs_steps  # = 6
-        num_amp_obs_per_step = TiV2AMPCfg.env.num_amp_obs_per_step  # = 43
-        # 总维度
-        num_amp_obs = num_amp_obs_steps * num_amp_obs_per_step  # 6 * 43 = 258
+        num_amp_obs_steps = TiV2AMPCfg.env.num_amp_obs_steps  # 6
+        num_amp_obs_per_step = TiV2AMPCfg.env.num_amp_obs_per_step  # 43
+        num_amp_obs = num_amp_obs_steps * num_amp_obs_per_step  # 258
 
-        # 时序对齐（dt 与 decimation 给 Runner 兜底使用）
         dt = 1.0 / 60.0
         decimation = 4
 
@@ -224,6 +216,6 @@ class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
         reward_scale = 2.0
         joint_names = None
 
-        # 任务/风格融合权重（若在 runner 里使用）
-        style_weight = 0.2
-        task_weight = 0.8
+        # 关键：纯风格
+        style_weight = 1.0
+        task_weight = 0.0

@@ -144,7 +144,7 @@ class TaskRegistry():
             # resume_path = get_load_path(log_root, load_run=train_cfg.runner.load_run, checkpoint=train_cfg.runner.checkpoint)
             # 下面两行按需保留/修改。注意：后一个会覆盖前一个。
             resume_path = '/home/xu/Xu/research/human01/logs/ti-12dof-realpd/Aug19_20-42-05_tiv2/model_11000.pt'  # example
-            resume_path = '/home/dy/dy/code/unitree_ti/logs/ti-12dof-realpd/Aug22_15-57-02_tiv2/model_10000.pt'      # example (覆盖上面)
+            resume_path = '/home/dy/dy/code/unitree_ti/logs/tiv2_amp/model_0.pt'      # example (覆盖上面)
             print(f"Loading model from: {resume_path}")
             runner.load(resume_path)
         return runner, train_cfg
