@@ -104,7 +104,7 @@ class TiV2AMPCfg(LeggedRobotCfg):
             # —— 最小任务 + 安全/正则 ——
             tracking_lin_vel = 1.0
             tracking_ang_vel = 1.0
-            action_rate = -0.01
+            action_rate = -0.001
             dof_pos_limits = -2.0
             collision = -1.0
             alive = 0.05
@@ -144,7 +144,7 @@ class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
     class runner:
         runner_class_name = "AMPOnPolicyRunner"
         algorithm_class_name = "AMP_PPO"
-        policy_class_name = "ActorCriticMoE"   # 或 "ActorCritic"
+        policy_class_name = "ActorCritic"   # 或 "ActorCritic" “ActorCriticMoE”
         experiment_name = "tiv2_amp"
         run_name = "tiv2_amp_run"
         resume = False
@@ -152,7 +152,7 @@ class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
         checkpoint = -1
         num_steps_per_env = 24
         max_iterations = 100000
-        save_interval = 50
+        save_interval = 500
         empirical_normalization = False
 
     class policy(LeggedRobotCfgPPO.policy):
@@ -179,8 +179,8 @@ class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
         use_smooth_ratio_clipping = False
 
     class discriminator:
-        hidden_dims = [1024, 512]
-        reward_scale = 2.0
+        hidden_dims = [256, 128]
+        reward_scale = 1.0
         loss_type = "BCEWithLogits"
         eta_wgan = 0.3
         reward_clamp_epsilon = 1e-4
@@ -207,5 +207,5 @@ class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
         joint_names = None
 
         # 任务/风格融合权重
-        style_weight = 0.5
-        task_weight = 0.5
+        style_weight = 0.05
+        task_weight = 0.95

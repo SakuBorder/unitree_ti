@@ -73,6 +73,8 @@ class Discriminator(nn.Module):
 
         self.to(self.device)
         self.train()
+        print(f"Discriminator trunk structure:\n{self.trunk}")
+        print(f"Discriminator head structure:\n{self.linear}")
 
     def forward(self, x: Tensor) -> Tensor:
         """Forward pass through the discriminator.

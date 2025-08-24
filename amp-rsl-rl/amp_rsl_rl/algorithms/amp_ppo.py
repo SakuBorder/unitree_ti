@@ -204,6 +204,9 @@ class AMP_PPO:
     def update(self) -> Tuple[float, float, float, float, float, float, float, float]:
         """
         同时更新 PPO 与 判别器。功能对齐版本A，返回 8 项统计。
+        显存与图生命周期关键修复：
+          - 所有 batch “数据张量”在进入优化循环后统一 detach()
+          - 不使用 retain_graph；判别器 grad-pen 仅 create_graph=True
         """
         mean_value_loss: float = 0.0
         mean_surrogate_loss: float = 0.0
@@ -276,32 +279,55 @@ class AMP_PPO:
             else:
                 raise RuntimeError(f"Unsupported minibatch sample length: {len(sample)}")
 
-            # === PPO 前向 ===
+            # ===================== 关键修复：统一 detach 数据张量 =====================
+            det = (lambda t: t.detach() if isinstance(t, torch.Tensor) else t)
+
+            obs_batch                 = det(obs_batch)
+            critic_obs_batch          = det(critic_obs_batch)
+            actions_batch             = det(actions_batch)
+            target_values_batch       = det(target_values_batch)
+            advantages_batch          = det(advantages_batch)
+            returns_batch             = det(returns_batch)
+            old_actions_log_prob_batch= det(old_actions_log_prob_batch)
+            old_mu_batch              = det(old_mu_batch)
+            old_sigma_batch           = det(old_sigma_batch)
+            masks_batch               = det(masks_batch)
+
+            if hid_states_batch is not None:
+                # 兼容 (hs_actor, hs_critic) / 列表 / 单个张量
+                def _det_hs(obj):
+                    if obj is None:
+                        return None
+                    if isinstance(obj, (tuple, list)):
+                        return tuple(det(x) for x in obj)
+                    return det(obj)
+                hs0 = _det_hs(hid_states_batch[0]) if isinstance(hid_states_batch, (tuple, list)) else _det_hs(hid_states_batch)
+                hs1 = _det_hs(hid_states_batch[1]) if isinstance(hid_states_batch, (tuple, list)) else None
+                hid_states_batch = (hs0, hs1)
+
+            # =========================== PPO 前向 ===========================
             self.actor_critic.act(
-                obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0]
+                obs_batch, masks=masks_batch, hidden_states=(hid_states_batch[0] if hid_states_batch else None)
             )
-            actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
+            actions_log_prob_batch_new = self.actor_critic.get_actions_log_prob(actions_batch)
             value_batch = self.actor_critic.evaluate(
-                critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1]
+                critic_obs_batch, masks=masks_batch, hidden_states=(hid_states_batch[1] if hid_states_batch else None)
             )
             mu_batch = self.actor_critic.action_mean
             sigma_batch = self.actor_critic.action_std
             entropy_batch = self.actor_critic.entropy
 
-            # === KL 自适应 LR（使用版本A的数值形式） ===
+            # === KL 自适应 LR（与版本A一致） ===
             if self.desired_kl is not None and self.schedule == "adaptive":
                 with torch.inference_mode():
                     kl = torch.sum(
-                        torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
-                        + (
-                            torch.square(old_sigma_batch)
-                            + torch.square(old_mu_batch - mu_batch)
-                        )
-                        / (2.0 * torch.square(sigma_batch))
+                        torch.log(sigma_batch / (old_sigma_batch + 1.0e-8) + 1.0e-5)
+                        + (old_sigma_batch.pow(2) + (old_mu_batch - mu_batch).pow(2))
+                          / (2.0 * sigma_batch.pow(2) + 1.0e-8)
                         - 0.5,
                         dim=-1,
                     )
-                    kl_mean = torch.mean(kl)
+                    kl_mean = kl.mean()
                     if kl_mean > self.desired_kl * 2.0:
                         self.learning_rate = max(1e-5, self.learning_rate / 1.5)
                     elif 0.0 < kl_mean < self.desired_kl / 2.0:
@@ -310,7 +336,7 @@ class AMP_PPO:
                         g["lr"] = self.learning_rate
 
             # === PPO 损失 ===
-            ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
+            ratio = torch.exp(actions_log_prob_batch_new - torch.squeeze(old_actions_log_prob_batch))
             min_, max_ = 1.0 - self.clip_param, 1.0 + self.clip_param
             if self.use_smooth_ratio_clipping:
                 clipped_ratio = (
@@ -334,10 +360,11 @@ class AMP_PPO:
 
             ppo_loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
-            # === AMP 判别器（与版本A同构） ===
+            # =========================== AMP 判别器 ===========================
             policy_state, policy_next_state = sample_amp_policy
             expert_state, expert_next_state = sample_amp_expert
 
+            # amp_normalizer 仅用于数值标准化，不需要图
             if self.amp_normalizer is not None:
                 with torch.no_grad():
                     policy_state = self.amp_normalizer.normalize(policy_state)
@@ -353,34 +380,36 @@ class AMP_PPO:
                 ),
                 dim=0,
             )
-            discriminator_output = self.discriminator(discriminator_input)
-            policy_d, expert_d = discriminator_output[:B_pol], discriminator_output[B_pol:]
+            discriminator_input = discriminator_input.to(self.device, non_blocking=False)
+            dout = self.discriminator(discriminator_input)
+            policy_d, expert_d = dout[:B_pol], dout[B_pol:]
 
-            # 手动 BCE（与版本A保持一致）
+            # BCE 判别器损失
             expert_loss = self.discriminator_expert_loss(expert_d)
             policy_loss = self.discriminator_policy_loss(policy_d)
             amp_loss = 0.5 * (expert_loss + policy_loss)
 
-            # 仅对 expert 做 grad penalty（BCE 分支与版本A一致）
+            # 梯度惩罚（BCE 分支仅对 expert 做，函数内部已区分；不要 retain_graph）
             grad_pen_loss = self.discriminator.compute_grad_pen(
-                expert_states=(expert_state, expert_next_state),
-                policy_states=(policy_state, policy_next_state),  # BCE 路径中会被忽略
+                expert_states=(expert_state.to(self.device), expert_next_state.to(self.device)),
+                policy_states=(policy_state.to(self.device), policy_next_state.to(self.device)),  # BCE 路径会忽略
                 lambda_=10.0,
             )
 
-            # 总损失
+            # =========================== 反传与更新 ===========================
             loss = ppo_loss + (amp_loss + grad_pen_loss)
 
-            # === 反传 & 更新 ===
-            self.optimizer.zero_grad()
+            # 更省显存的 zero_grad
+            self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
 
-            # 归一化器更新
+            # 归一化器更新（无需图）
             if self.amp_normalizer is not None:
-                self.amp_normalizer.update(policy_state)
-                self.amp_normalizer.update(expert_state)
+                with torch.no_grad():
+                    self.amp_normalizer.update(policy_state)
+                    self.amp_normalizer.update(expert_state)
 
             # 统计
             policy_d_prob = torch.sigmoid(policy_d)
@@ -414,6 +443,7 @@ class AMP_PPO:
         if mean_accuracy_expert_elem > 0:
             mean_accuracy_expert /= mean_accuracy_expert_elem
 
+        # 清空 rollout 存储（释放图引用）
         self.storage.clear()
 
         # 与版本A一致：返回 8 项
