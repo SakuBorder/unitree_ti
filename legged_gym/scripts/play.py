@@ -57,7 +57,7 @@ def play(args):
         actions = policy(obs.detach())
         # actions[0][5] = 0
         # actions[0][11] = 0
-        env.commands[:, 0] = 0.0
+        env.commands[:, 0] = 0.6
         env.commands[:, 1] = 0.0
         env.commands[:, 2] = 0.0
         obs, _, rews, dones, infos ,_,_= env.step(actions.detach())
