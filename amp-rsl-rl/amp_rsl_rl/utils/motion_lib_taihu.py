@@ -56,7 +56,7 @@ class MotionLibTaihu(MotionLibBase):
         
         self.mesh_parsers = Taihu_Humanoid_Batch(extend_hand=extend_hand, extend_head=extend_head, mjcf_file=mjcf_file)
         dof_axis = self.mesh_parsers.dof_axis
-        self.isaac_gym_joint_mapping = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        self.isaac_gym_joint_mapping = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,11]
         
         self.use_joint_mapping = True
         self.debug_dof = False
@@ -262,19 +262,19 @@ class MotionLibTaihu(MotionLibBase):
 
         mapped_dof = torch.zeros_like(dof_pos)
 
-        if dof_pos.shape[-1] >= 30 and len(self.isaac_gym_joint_mapping) == 30:
-            for i, mapping_idx in enumerate(self.isaac_gym_joint_mapping):
-                if i < mapped_dof.shape[-1] and mapping_idx < dof_pos.shape[-1]:
-                    val = dof_pos[:, mapping_idx]         
+        # if dof_pos.shape[-1] >= 30 and len(self.isaac_gym_joint_mapping) == 30:
+        for i, mapping_idx in enumerate(self.isaac_gym_joint_mapping):
+            if i < mapped_dof.shape[-1] and mapping_idx < dof_pos.shape[-1]:
+                val = dof_pos[:, mapping_idx]         
 
-                    if i in self.sign_flip_set:
-                        val = -val
+                if i in self.sign_flip_set:
+                    val = -val
 
-                    mapped_dof[:, i] = val               
-            return mapped_dof
-        else:
-            print(f"Warning: Cannot apply mapping. DOF shape: {dof_pos.shape}, mapping len: {len(self.isaac_gym_joint_mapping)}")
-            return dof_pos
+                mapped_dof[:, i] = val               
+        return mapped_dof
+    # else:
+    #     print(f"Warning: Cannot apply mapping. DOF shape: {dof_pos.shape}, mapping len: {len(self.isaac_gym_joint_mapping)}")
+    #     return dof_pos
 
     def get_motion_state(self, motion_ids, motion_times, offset=None):
 

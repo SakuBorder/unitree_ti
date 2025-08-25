@@ -8,7 +8,7 @@ import smpl_sim.poselib.core.rotation3d as pRot
 
 
 class Taihu_Humanoid_Batch:
-    def __init__(self, mjcf_file="path/to/taihu.xml", extend_hand=True, extend_head=True, device=torch.device("cpu")):
+    def __init__(self, mjcf_file="path/to/taihu.xml", extend_hand=False, extend_head=False, device=torch.device("cpu")):
         self.mjcf_data = mjcf_data = self.from_mjcf(mjcf_file)
         self.dof_axis = mjcf_data["dof_axis"].to(device)  # 从 MJCF 解析的旋转轴
         self.extend_hand = extend_hand

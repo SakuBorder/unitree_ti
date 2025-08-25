@@ -441,6 +441,23 @@ class MotionLibBase():
     #     self._termination_history[self._curr_motion_ids] += termination
     #     # print("termination history: ", self._termination_history[self._curr_motion_ids])
 
+    # def sample_motions(self, n):
+    #     # 添加调试信息
+    #     print(f"[DEBUG] _sampling_batch_prob shape: {self._sampling_batch_prob.shape}")
+    #     print(f"[DEBUG] _sampling_batch_prob stats: min={self._sampling_batch_prob.min()}, max={self._sampling_batch_prob.max()}, sum={self._sampling_batch_prob.sum()}")
+    #     print(f"[DEBUG] has nan: {torch.isnan(self._sampling_batch_prob).any()}")
+    #     print(f"[DEBUG] has inf: {torch.isinf(self._sampling_batch_prob).any()}")
+        
+    #     if self._sampling_batch_prob.sum() <= 0 or torch.isnan(self._sampling_batch_prob).any():
+    #         print("[ERROR] Invalid sampling probabilities detected!")
+    #         # 使用均匀分布作为fallback
+    #         uniform_prob = torch.ones_like(self._sampling_batch_prob) / len(self._sampling_batch_prob)
+    #         motion_ids = torch.multinomial(uniform_prob, num_samples=n, replacement=True).to(self._device)
+    #     else:
+    #         motion_ids = torch.multinomial(self._sampling_batch_prob, num_samples=n, replacement=True).to(self._device)
+        
+    #     return motion_ids
+
     def sample_motions(self, n):
         motion_ids = torch.multinomial(self._sampling_batch_prob, num_samples=n, replacement=True).to(self._device)
 
