@@ -1,6 +1,7 @@
-import joblib, numpy as np
+import joblib
+import numpy as np
 
-p = "data/ti512/v1/singles/0-Male2Walking_c3d_B15 -  Walk turn around_poses.pkl"
+p = "/home/dy/dy/code/unitree_ti/data/ti512/v1/singles/Male2Walking_c3d/B9 -  Walk turn left 90_poses.pkl"
 d = joblib.load(p)
 
 print("== keys ==", list(d.keys()))
@@ -10,11 +11,28 @@ m = d[k]
 def sh(x):
     return getattr(x, "shape", None)
 
-print("root_trans_offset:", sh(m.get("root_trans_offset")))
-print("root_rot        :", sh(m.get("root_rot")))
-print("pose_aa         :", sh(m.get("pose_aa")))
-print("dof             :", sh(m.get("dof")))
-print("fps             :", m.get("fps"))
+# 检查并打印字段
+required_fields = ['root_trans_offset', 'root_rot', 'pose_aa', 'dof', 'fps']
+missing_fields = []
+
+for field in required_fields:
+    if field not in m:
+        missing_fields.append(field)
+
+if missing_fields:
+    print(f"[WARNING] Missing fields: {', '.join(missing_fields)}")
+
+# 如果字段存在，则打印它们的 shape
+if 'root_trans_offset' in m:
+    print("root_trans_offset:", sh(m["root_trans_offset"]))
+if 'root_rot' in m:
+    print("root_rot        :", sh(m["root_rot"]))
+if 'pose_aa' in m:
+    print("pose_aa         :", sh(m["pose_aa"]))
+if 'dof' in m:
+    print("dof             :", sh(m["dof"]))
+if 'fps' in m:
+    print("fps             :", m["fps"])
 
 # 看第0帧的大小
 if m.get("dof") is not None:
