@@ -19,7 +19,7 @@ from scipy.spatial.transform import Rotation as sRot
 import random
 from amp_rsl_rl.utils.flags import flags
 from amp_rsl_rl.utils.motion_lib_base import MotionLibBase, DeviceCache, compute_motion_dof_vels, FixHeightMode
-from amp_rsl_rl.utils.torch_humanoid_batch import Humanoid_Batch
+from amp_rsl_rl.utils.torch_taihu_humanoid_batch import Taihu_Humanoid_Batch
 from easydict import EasyDict
 
 def to_torch(tensor):
@@ -54,11 +54,8 @@ class MotionLibTaihu(MotionLibBase):
                         masterfoot_conifg=masterfoot_conifg, min_length=min_length, 
                         im_eval=im_eval, multi_thread=multi_thread, sim_timestep=sim_timestep)
         
-        cfg = EasyDict({
-            'asset': EasyDict({'assetFileName': mjcf_file}),
-            'extend_config': []
-        })
-        self.mesh_parsers = Humanoid_Batch(cfg)
+        self.mesh_parsers = Taihu_Humanoid_Batch(extend_hand=extend_hand, extend_head=extend_head, mjcf_file=mjcf_file)
+        dof_axis = self.mesh_parsers.dof_axis
         self.isaac_gym_joint_mapping = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,11]
         
         self.use_joint_mapping = True
