@@ -2,7 +2,7 @@ import os
 import sys
 import numpy as np
 from isaacgym import gymapi, gymutil, gymtorch
-from isaacgym.torch_utils import quat_mul, quat_rotate
+from isaacgym.torch_utils import quat_mul, quat_rotate, quat_conjugate
 
 sys.path.append(os.getcwd())
 
@@ -395,7 +395,8 @@ while not gym.query_viewer_has_closed(viewer):
                     dtype=root_pos.dtype,
                 )
 
-                root_rot = quat_mul(y_to_z_quat, root_rot)
+                y_to_z_conj = quat_conjugate(y_to_z_quat)
+                root_rot = quat_mul(y_to_z_quat, quat_mul(root_rot, y_to_z_conj))
                 root_pos = root_pos @ rot_mat.T
                 root_vel = root_vel @ rot_mat.T
                 root_ang_vel = root_ang_vel @ rot_mat.T
