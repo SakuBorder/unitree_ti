@@ -80,11 +80,18 @@ def load_motion(motion_file, mjcf_file, device):
 
 def main():
     custom = [
-        gymutil.Argument("--asset", str, "assert/ti5/tai5_12dof_no_limit.urdf", "URDF path"),
-        gymutil.Argument("--mjcf", str, "assert/ti5/ti5_12dof.xml", "MJCF path"),
-        gymutil.Argument("--motion", str, "data/ti512/v1/singles/walk/B9 -  Walk turn left 90_poses.pkl", "Motion file"),
+        {"name": "--asset", "type": str, "default": "assert/ti5/tai5_12dof_no_limit.urdf", "help": "URDF path"},
+        {"name": "--mjcf", "type": str, "default": "assert/ti5/ti5_12dof.xml", "help": "MJCF path"},
+        {
+            "name": "--motion",
+            "type": str,
+            "default": "data/ti512/v1/singles/walk/B9 -  Walk turn left 90_poses.pkl",
+            "help": "Motion file",
+        },
     ]
-    args = gymutil.parse_arguments(description="Taihu Motion Viewer", custom_parameters=custom)
+    args = gymutil.parse_arguments(
+        description="Taihu Motion Viewer", custom_parameters=custom
+    )
     gym, sim = create_sim(args)
     gym.add_ground(sim, gymapi.PlaneParams())
     viewer = gym.create_viewer(sim, gymapi.CameraProperties())
