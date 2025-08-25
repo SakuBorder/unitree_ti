@@ -75,12 +75,35 @@ class AMPOnPolicyRunner:
         policy_cls = policies.get(policy_name, ActorCritic)
 
         policy_kwargs = {k: v for k, v in self.policy_cfg.items() if k not in ("class_name",)}
-        self.actor_critic: ActorCritic | ActorCriticRecurrent | Any = policy_cls(
-            num_actor_obs=num_actor_obs,
-            num_critic_obs=num_critic_obs,
-            num_actions=num_actions,
-            **policy_kwargs,
-        ).to(self.device)
+
+        if issubclass(policy_cls, HIMActorCritic):
+            num_one_step_obs = int(getattr(self.env, "num_one_step_obs", num_actor_obs))
+            num_one_step_critic_obs = int(
+                getattr(
+                    self.env,
+                    "num_one_step_privileged_obs",
+                    getattr(self.env, "num_one_step_obs", num_critic_obs),
+                )
+            )
+            actor_history_length = int(getattr(self.env, "actor_history_length", 1))
+            critic_history_length = int(getattr(self.env, "critic_history_length", actor_history_length))
+            self.actor_critic: ActorCritic | ActorCriticRecurrent | Any = policy_cls(
+                num_actor_obs=num_actor_obs,
+                num_critic_obs=num_critic_obs,
+                num_one_step_obs=num_one_step_obs,
+                num_one_step_critic_obs=num_one_step_critic_obs,
+                actor_history_length=actor_history_length,
+                critic_history_length=critic_history_length,
+                num_actions=num_actions,
+                **policy_kwargs,
+            ).to(self.device)
+        else:
+            self.actor_critic: ActorCritic | ActorCriticRecurrent | Any = policy_cls(
+                num_actor_obs=num_actor_obs,
+                num_critic_obs=num_critic_obs,
+                num_actions=num_actions,
+                **policy_kwargs,
+            ).to(self.device)
 
         # ---- AMP timing ----
         dt_cfg = getattr(getattr(self.env, "cfg", None), "sim", None)
