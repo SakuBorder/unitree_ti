@@ -382,21 +382,22 @@ while not gym.query_viewer_has_closed(viewer):
                 root_vel = motion_res["root_vel"]
                 root_ang_vel = motion_res["root_ang_vel"]
 
-                # rotate from original Y-up to Z-up
-                y_to_z_quat = torch.tensor(
-                    [np.sqrt(0.5), 0.0, 0.0, np.sqrt(0.5)],
+                # rotate from original Y-up (X-right, Y-up, Z-forward)
+                # to Isaac Gym's Z-up (X-forward, Y-right, Z-up)
+                yup_to_zup_quat = torch.tensor(
+                    [0.5, -0.5, -0.5, -0.5],
                     device=root_rot.device,
                     dtype=root_rot.dtype,
                 ).repeat(root_rot.shape[0], 1)
 
                 rot_mat = torch.tensor(
-                    [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]],
+                    [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]],
                     device=root_pos.device,
                     dtype=root_pos.dtype,
                 )
 
-                y_to_z_conj = quat_conjugate(y_to_z_quat)
-                root_rot = quat_mul(y_to_z_quat, quat_mul(root_rot, y_to_z_conj))
+                yup_to_zup_conj = quat_conjugate(yup_to_zup_quat)
+                root_rot = quat_mul(yup_to_zup_quat, quat_mul(root_rot, yup_to_zup_conj))
                 root_pos = root_pos @ rot_mat.T
                 root_vel = root_vel @ rot_mat.T
                 root_ang_vel = root_ang_vel @ rot_mat.T
@@ -423,6 +424,10 @@ while not gym.query_viewer_has_closed(viewer):
 
                 if "rg_pos" in motion_res:
                     rb_pos = motion_res["rg_pos"] @ rot_mat.T
+                    ground_offset = rb_pos[..., 2].min()
+                    rb_pos[..., 2] -= ground_offset
+                    root_pos[:, 2] -= ground_offset
+
                     gym.clear_lines(viewer)
                     gym.refresh_rigid_body_state_tensor(sim)
 
