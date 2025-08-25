@@ -161,7 +161,7 @@ class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
     class runner:
         runner_class_name = "AMPOnPolicyRunner"
         algorithm_class_name = "AMP_PPO"
-        policy_class_name = "ActorCritic"
+        policy_class_name = "HIMActorCritic"
         experiment_name = "tiv2_amp_phaseA"
         run_name = "tiv2_amp_phaseA_run"
         resume = False

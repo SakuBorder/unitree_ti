@@ -9,6 +9,7 @@ from torch.utils.tensorboard import SummaryWriter as TensorboardSummaryWriter
 import rsl_rl
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent
+from rsl_rl.modules.him_actor_critic import HIMActorCritic
 from rsl_rl.networks import EmpiricalNormalization
 from rsl_rl.utils import store_code_state
 
@@ -68,18 +69,41 @@ class AMPOnPolicyRunner:
 
         # ---- policy ----
         policy_name = self.runner_cfg.get("policy_class_name", self.policy_cfg.get("class_name", "ActorCritic"))
-        policies: Dict[str, Any] = {"ActorCritic": ActorCritic}
+        policies: Dict[str, Any] = {"ActorCritic": ActorCritic, "HIMActorCritic": HIMActorCritic}
         if _HAS_MOE and ActorCriticMoE is not None:
             policies["ActorCriticMoE"] = ActorCriticMoE
         policy_cls = policies.get(policy_name, ActorCritic)
 
         policy_kwargs = {k: v for k, v in self.policy_cfg.items() if k not in ("class_name",)}
-        self.actor_critic: ActorCritic | ActorCriticRecurrent | Any = policy_cls(
-            num_actor_obs=num_actor_obs,
-            num_critic_obs=num_critic_obs,
-            num_actions=num_actions,
-            **policy_kwargs,
-        ).to(self.device)
+
+        if issubclass(policy_cls, HIMActorCritic):
+            num_one_step_obs = int(getattr(self.env, "num_one_step_obs", num_actor_obs))
+            num_one_step_critic_obs = int(
+                getattr(
+                    self.env,
+                    "num_one_step_privileged_obs",
+                    getattr(self.env, "num_one_step_obs", num_critic_obs),
+                )
+            )
+            actor_history_length = int(getattr(self.env, "actor_history_length", 1))
+            critic_history_length = int(getattr(self.env, "critic_history_length", actor_history_length))
+            self.actor_critic: ActorCritic | ActorCriticRecurrent | Any = policy_cls(
+                num_actor_obs=num_actor_obs,
+                num_critic_obs=num_critic_obs,
+                num_one_step_obs=num_one_step_obs,
+                num_one_step_critic_obs=num_one_step_critic_obs,
+                actor_history_length=actor_history_length,
+                critic_history_length=critic_history_length,
+                num_actions=num_actions,
+                **policy_kwargs,
+            ).to(self.device)
+        else:
+            self.actor_critic: ActorCritic | ActorCriticRecurrent | Any = policy_cls(
+                num_actor_obs=num_actor_obs,
+                num_critic_obs=num_critic_obs,
+                num_actions=num_actions,
+                **policy_kwargs,
+            ).to(self.device)
 
         # ---- AMP timing ----
         dt_cfg = getattr(getattr(self.env, "cfg", None), "sim", None)
@@ -360,7 +384,7 @@ class AMPOnPolicyRunner:
                     mean_style_reward_log += style_rewards.mean().item()
                     rewards = self.task_w * rewards + self.style_w * style_rewards
 
-                    self.alg.process_env_step(rewards, dones, infos)
+                    self.alg.process_env_step(rewards, dones, infos, critic_next)
                     self.alg.process_amp_step(next_amp_obs)
 
                     # 处理终止时的 critic 替换
