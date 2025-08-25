@@ -15,6 +15,11 @@ for _name, _py in _aliases:
         setattr(_np, _name, _py)
 # ===========================================================
 
+# --- 必须最先导入 isaacgym（早于任何 torch 相关导入）---
+import isaacgym
+from isaacgym.torch_utils import quat_rotate, quat_from_angle_axis, quat_mul
+# ----------------------------------------------------------
+
 import glob
 import os
 import sys
@@ -24,10 +29,7 @@ sys.path.append(os.getcwd())
 import math
 import joblib
 import numpy as np
-import torch
-import torch.nn.functional as F
-import torch.multiprocessing as mp
-from torch.autograd import Variable
+
 from tqdm import tqdm
 from scipy.spatial.transform import Rotation as sRot
 
@@ -35,6 +37,7 @@ from easydict import EasyDict
 import hydra
 from omegaconf import DictConfig
 
+# 这些模块可能间接 import torch，所以要放在 isaacgym 之后
 from smpl_sim.utils import torch_utils
 from smpl_sim.poselib.skeleton.skeleton3d import SkeletonTree, SkeletonMotion, SkeletonState
 from smpl_sim.smpllib.smpl_parser import SMPL_Parser, SMPLH_Parser, SMPLX_Parser
@@ -48,6 +51,12 @@ from smpl_sim.utils.pytorch3d_transforms import axis_angle_to_matrix
 from smpl_sim.utils.smoothing_utils import gaussian_kernel_1d, gaussian_filter_1d_batch
 
 from amp_rsl_rl.utils.torch_humanoid_batch import Humanoid_Batch
+
+# torch 的导入必须在 isaacgym 之后
+import torch
+import torch.nn.functional as F
+import torch.multiprocessing as mp
+from torch.autograd import Variable
 
 
 # --------------------------
@@ -165,6 +174,7 @@ def load_amass_data(data_path, cfg):
 # --------------------------
 # Shape fitting utilities
 # --------------------------
+
 def _build_robot_smpl_correspondence(humanoid_fk, cfg):
     """根据 cfg.robot.joint_matches 建立机器人与SMPL索引映射。"""
     robot_joint_names_augment = humanoid_fk.body_names_augment
@@ -323,6 +333,28 @@ def ensure_shape_file(
 # --------------------------
 # Retarget: AMASS
 # --------------------------
+
+def _find_smpl_index(name_candidates):
+    """
+    在 SMPL_BONE_ORDER_NAMES 中鲁棒查找候选名，大小写不敏感。
+    支持 'L_ANKLE' / 'L_Ankle' / 'left_ankle' / 'L_FOOT' / 'L_TOE' 等常见别名。
+    """
+    names = [n.lower() for n in SMPL_BONE_ORDER_NAMES]
+    # 先精确匹配
+    for cand in name_candidates:
+        cl = cand.lower()
+        for i, n in enumerate(names):
+            if n == cl:
+                return i
+    # 再做包含式匹配（更宽松）
+    for cand in name_candidates:
+        cl = cand.lower()
+        for i, n in enumerate(names):
+            if cl in n:
+                return i
+    raise KeyError(f"None of {name_candidates} found in SMPL_BONE_ORDER_NAMES")
+
+
 def process_motion(key_names, key_name_to_pkls, cfg):
     device = torch.device("cpu")
 
@@ -349,11 +381,22 @@ def process_motion(key_names, key_name_to_pkls, cfg):
         shape_new = torch.zeros([1, 10])
         scale = torch.ones([1])
 
+    # 预定义脚部候选名（尽量覆盖常见数据集命名）
+    L_CANDS = ["L_ANKLE", "L_Ankle", "left_ankle", "L_FOOT", "left_foot", "L_TOE", "left_toe"]
+    R_CANDS = ["R_ANKLE", "R_Ankle", "right_ankle", "R_FOOT", "right_foot", "R_TOE", "right_toe"]
+    try:
+        l_idx = _find_smpl_index(L_CANDS)
+        r_idx = _find_smpl_index(R_CANDS)
+    except Exception as e:
+        print(f"[WARN] Foot joint index resolve failed ({e}). Fallback to default SMPL indices: L_Ankle=7, R_Ankle=8")
+        # 常见 SMPL 24 关节模板中脚踝常在 7/8（如不对请按你的模板修正）
+        l_idx, r_idx = 7, 8
+
     all_data = {}
     pbar = tqdm(key_names, position=0, leave=True)
     for data_key in pbar:
         npz_path = key_name_to_pkls[data_key]
-        loaded, reason = load_amass_data(npz_path, cfg)   # <<<<<< 改这里：传 cfg
+        loaded, reason = load_amass_data(npz_path, cfg)   # 传 cfg
         if loaded is None:
             print(f"[SKIP] {data_key}: {reason}")
             continue
@@ -517,12 +560,20 @@ def process_motion(key_names, key_name_to_pkls, cfg):
             print(f"[SKIP] {data_key}: quat_convert_error:{e}")
             continue
 
+        # ====== 关键新增：导出左右脚关键点（世界坐标，已对齐地面 + z_offset） ======
+        try:
+            key_body_positions_world = joints_dump[:, [l_idx, r_idx], :].copy()  # (T,2,3)
+        except Exception as e:
+            print(f"[WARN] build key_body_positions_world failed: {e}")
+            key_body_positions_world = None
+
         data_dump = {
             "root_trans_offset": root_trans_offset_dump.squeeze().detach().numpy(),
-            "pose_aa": pose_aa_h1_new.squeeze().detach().numpy(),
-            "dof": dof_pos_new.squeeze().detach().numpy(),
-            "root_rot": root_rot_quat_clean,
-            "smpl_joints": joints_dump,
+            "pose_aa":           pose_aa_h1_new.squeeze().detach().numpy(),
+            "dof":               dof_pos_new.squeeze().detach().numpy(),
+            "root_rot":          root_rot_quat_clean,
+            "smpl_joints":       joints_dump,
+            "key_body_positions_world": key_body_positions_world,  # <<<<<< 新增字段
             "fps": 30,
             # 元信息
             "dof_names": list(cfg.robot.dof_names),
@@ -614,7 +665,6 @@ def main(cfg: DictConfig) -> None:
 
         joblib.dump(single_motion_data, dumped_file)
         print(f"Saved: {dumped_file}")
-
 
     print(f"Total {len(all_data)} motions saved to {save_dir}")
 

@@ -1,13 +1,9 @@
 # legged_gym/envs/tiv2/ti_amp_config.py
 from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg, LeggedRobotCfgPPO
 
-class TiV2AMPCfg(LeggedRobotCfg):
-    """TiV2 AMP Environment Configuration - 阶段A（纯风格 & 与 HumanoidAMP 对齐的 AMP 观测）"""
-
+class TiV2NoAMPCfg(LeggedRobotCfg):
     class init_state(LeggedRobotCfg.init_state):
-        # 初始位姿（x, y, z）
         pos = [0.0, 1.0, 0.95]
-        # 站立姿态（与 12-DOF 机体一致）
         default_joint_angles = {
             'L_ANKLE_R': 0.0,
             'R_ANKLE_R': 0.0,
@@ -24,23 +20,17 @@ class TiV2AMPCfg(LeggedRobotCfg):
         }
 
     class env(LeggedRobotCfg.env):
-        # 动作/关节
         num_actions = 12
-        num_lower_dof = 12  # = num_dof
-
-        # ===== AMP 历史配置（与 HumanoidAMP 对齐）=====
-        # TiV2: num_dof=12, key_bodies=2 -> 13 + 2*12 + 3*2 = 43
+        num_lower_dof = 12
         num_amp_obs_per_step = 43
         num_amp_obs_steps = 6
-        num_amp_obs = num_amp_obs_steps * num_amp_obs_per_step  # 258
-
-        # 原环境观察量（用于 actor/critic）
-        num_one_step_observations = 2 * 12 + 11 + 12  # 47（与 TiV2 保持一致）
-        num_one_step_privileged_obs = num_one_step_observations + 3  # 50
+        num_amp_obs = num_amp_obs_steps * num_amp_obs_per_step
+        num_one_step_observations = 2 * 12 + 11 + 12
+        num_one_step_privileged_obs = num_one_step_observations + 3
         num_actor_history = 6
         num_critic_history = 1
-        num_observations = num_actor_history * num_one_step_observations  # 282
-        num_privileged_obs = num_critic_history * num_one_step_privileged_obs  # 50
+        num_observations = num_actor_history * num_one_step_observations
+        num_privileged_obs = num_critic_history * num_one_step_privileged_obs
 
     class viewer(LeggedRobotCfg.viewer):
         ref_env = 0
@@ -66,21 +56,16 @@ class TiV2AMPCfg(LeggedRobotCfg):
             'ANKLE_P': 2,
         }
         action_scale = 0.25
-        decimation = 4  # 15Hz 动作（若 sim 60Hz）
+        decimation = 4
 
-    # ===== 阶段A：命令恒定，episode 内不变 =====
     class commands(LeggedRobotCfg.commands):
-        # 保留字段以兼容父类，但在阶段A中由 TiV2AMPRobot 冻结为常量
         resampling_time = 1e9
         lin_vel_x = [0.8, 0.8]
         lin_vel_y = [0.0, 0.0]
         ang_vel_yaw = [0.0, 0.0]
-
-        # 被 TiV2AMPRobot 读取并强制写入 self.commands
         phaseA_vx = 0.8
         phaseA_vy = 0.0
         phaseA_yaw = 0.0
-        # 若要原地踏步：phaseA_vx = 0.0
 
     class asset(LeggedRobotCfg.asset):
         file = '/home/dy/dy/code/unitree_ti/assert/ti5/tai5_12dof_no_limit.urdf'
@@ -94,7 +79,6 @@ class TiV2AMPCfg(LeggedRobotCfg):
         flip_visual_attachments = False
 
     class domain_rand(LeggedRobotCfg.domain_rand):
-        # 阶段A可适度随机化；若不稳定可暂时调弱
         randomize_friction = True
         friction_range = [0.1, 1.25]
         randomize_base_mass = True
@@ -113,56 +97,49 @@ class TiV2AMPCfg(LeggedRobotCfg):
     class rewards(LeggedRobotCfg.rewards):
         soft_dof_pos_limit = 0.9
         base_height_target = 0.92
+        least_feet_distance_lateral = 0.2
+        most_feet_distance_lateral = 0.35
 
         class scales(LeggedRobotCfg.rewards.scales):
-            # 任务项全部关闭（阶段A：只学风格）
-            tracking_lin_vel = 10.0
-            tracking_ang_vel = 0.0
-
-            # 轻度正则，避免奇异姿态
-            action_rate = -0.0002
-            dof_pos_limits = -2.0
-            collision = -1.0
-            alive = 0.05
-
-            # 其它关闭，避免与风格奖励冲突
-            lin_vel_z = 0.0
-            ang_vel_xy = 0.0
-            orientation = 0.0
-            base_height = 0.0
-            dof_acc = 0.0
-            torques = 0.0
-            hip_pos = 0.0
-            ankle_pos = 0.0
-            feet_swing_height = 0.0
-            feet_parallel = 0.0
-            feet_heading_alignment = 0.0
+            tracking_lin_vel = 1.0
+            tracking_ang_vel = 1.0
+            lin_vel_z = -2.0
+            ang_vel_xy = -0.5
+            orientation = -1.0
+            base_height = -100.0
+            dof_acc = -2.5e-7
             feet_air_time = 0.0
-            contact = 0.0
-            lin_acc = 0.0
-            contact_momentum = 0.0
+            collision = -1.0
+            action_rate = -0.01
+            torques = 0.0
+            dof_pos_limits = -5.0
+            alive = 0.15
+            hip_pos = -10.0
+            ankle_pos = -50.0
+            feet_swing_height = -100.0
+            contact = 1.0
+            feet_parallel = -1.0
+            feet_heading_alignment = -1.0
+            lin_acc = -2.5e-5
+            contact_momentum = 2.5e-2
 
     class observations:
         class amp:
-            # AMP 分量（与环境内 TiV2AMPRobot._compute_amp_observations_single_step 对齐）
             joint_pos = True
             joint_vel = True
             base_lin_vel_local = True
             base_ang_vel_local = True
             root_height = False
             root_rot_tannorm = True
-            key_body_pos_local = True  # 默认使用左右脚
+            key_body_pos_local = True
 
-
-class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
-    """TiV2 AMP PPO Training Configuration - 阶段A（纯风格）"""
-
+class TiV2NoAMPCfgPPO(LeggedRobotCfgPPO):
     class runner:
         runner_class_name = "AMPOnPolicyRunner"
         algorithm_class_name = "AMP_PPO"
         policy_class_name = "ActorCritic"
-        experiment_name = "tiv2_amp_phaseA"
-        run_name = "tiv2_amp_phaseA_run"
+        experiment_name = "tiv2_noamp"
+        run_name = "tiv2_noamp"
         resume = False
         load_run = ".*"
         checkpoint = -1
@@ -176,7 +153,7 @@ class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
         actor_hidden_dims = [512, 256, 128]
         critic_hidden_dims = [512, 256, 128]
         activation = 'elu'
-        num_experts = 1  # 可选 MoE
+        num_experts = 1
 
     class algorithm:
         num_learning_epochs = 5
@@ -201,31 +178,20 @@ class TiV2AMPCfgPPO(LeggedRobotCfgPPO):
         eta_wgan = 0.3
         reward_clamp_epsilon = 1e-4
 
-    # ===== AMP 数据/观测配置（阶段A：纯风格）=====
     class amp:
-        # 使用你生成的单动作 pkl 数据根目录（retarget 输出）
         amp_data_path = "/home/dy/dy/code/unitree_ti/data/ti512/v1/singles"
-        dataset_names = ["walk"]          # 支持目录或具体文件基名
+        dataset_names = ["walk"]
         dataset_weights = [1.0]
         slow_down_factor = 1
-
-        # 与环境对齐：每步 43 维，历史 6 步
-        num_amp_obs_steps = TiV2AMPCfg.env.num_amp_obs_steps       # 6
-        num_amp_obs_per_step = TiV2AMPCfg.env.num_amp_obs_per_step # 43
-        num_amp_obs = num_amp_obs_steps * num_amp_obs_per_step     # 258
-
-        # 历史窗口在 Loader 内也需要（若你的 Runner 传参给 AMPLoader）
+        num_amp_obs_steps = TiV2NoAMPCfg.env.num_amp_obs_steps
+        num_amp_obs_per_step = TiV2NoAMPCfg.env.num_amp_obs_per_step
+        num_amp_obs = num_amp_obs_steps * num_amp_obs_per_step
         history_steps = num_amp_obs_steps
         history_stride = 1
-
-        # 仿真/控制步长（与 env.control.decimation=4 搭配 → 动作 15Hz）
         dt = 1.0 / 60.0
         decimation = 4
-
         replay_buffer_size = 100000
         reward_scale = 2.0
         joint_names = None
-
-        # 关键：纯风格（无任务）
-        style_weight = 1.0
-        task_weight = 0.5
+        style_weight = 0.0
+        task_weight = 1.0

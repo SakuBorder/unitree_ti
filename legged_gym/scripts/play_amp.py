@@ -130,7 +130,7 @@ def load_policy_with_runner(env, train_cfg, device):
 
 def play(args):
     # 任务名与训练环境注册名一致（你用的是 TiV2AMPRobot 对应的 "tiv2_amp"）
-    args.task = "tiv2_amp"
+    args.task = "tiv2_noamp"
 
     env, train_cfg = make_env_for_test(args)
     device = env.device

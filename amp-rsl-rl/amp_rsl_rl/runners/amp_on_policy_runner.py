@@ -181,6 +181,15 @@ class AMPOnPolicyRunner:
             else:
                 dataset_weights = dataset_weights + [1.0] * (len(dataset_names) - len(dataset_weights))
 
+        # --- set loader flag for root height before building AMPLoader ---
+        use_root_h = bool(
+            getattr(getattr(self.env, "cfg", None), "observations", None)
+            and getattr(self.env.cfg.observations, "amp", None)
+            and getattr(self.env.cfg.observations.amp, "root_height", False)
+        )
+        os.environ["AMP_USE_ROOT_H"] = "1" if use_root_h else "0"
+
+        # build expert data
         amp_data = AMPLoader(
             self.device,
             str(root),
@@ -298,13 +307,28 @@ class AMPOnPolicyRunner:
             loss_type=self.discriminator_cfg.get("loss_type", "BCEWithLogits"),
         ).to(self.device)
 
+        # --- sanity checks (AFTER discriminator is created) ---
+        # --- sanity checks (AFTER discriminator is created) ---
+        if self.amp_data.sample_item_dim != num_amp_obs:
+            raise ValueError(
+                f"AMP obs dim mismatch: env={num_amp_obs}, data={self.amp_data.sample_item_dim}"
+            )
+
+        disc_expected = 2 * num_amp_obs
+        if self.discriminator.input_dim != disc_expected:
+            raise ValueError(
+                f"Discriminator input_dim={self.discriminator.input_dim} should equal {disc_expected} (=2*num_amp_obs)"
+            )
+
         # --- Algorithm ---
         algo_name = self.runner_cfg.get("algorithm_class_name", self.alg_cfg.get("class_name", "AMP_PPO"))
         if algo_name != "AMP_PPO":
             print(f"[AMPOnPolicyRunner] Algorithm '{algo_name}' not supported; falling back to 'AMP_PPO'.")
+
         raw_algo_kwargs = {k: v for k, v in self.alg_cfg.items() if k != "class_name"}
-        allowed = set(inspect.signature(AMP_PPO.__init__).parameters.keys()) - {"self"}
+        allowed = set(inspect.signature(AMP_PPO.__init__).parameters) - {"self"}
         algo_kwargs = {k: v for k, v in raw_algo_kwargs.items() if k in allowed}
+
         dropped = sorted(set(raw_algo_kwargs) - set(algo_kwargs))
         if dropped:
             print(f"[AMPOnPolicyRunner] Dropped unsupported AMP_PPO args: {dropped}")
@@ -312,11 +336,13 @@ class AMPOnPolicyRunner:
         self.alg: AMP_PPO = AMP_PPO(
             actor_critic=self.actor_critic,
             discriminator=self.discriminator,
-            amp_data=amp_data,
+            amp_data=self.amp_data,
             amp_normalizer=self.amp_normalizer,
             device=self.device,
             **algo_kwargs,
         )
+
+
 
         # --- rollout/logging ---
         self.num_steps_per_env = int(self.runner_cfg.get("num_steps_per_env", 24))
@@ -347,6 +373,8 @@ class AMPOnPolicyRunner:
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
+
+
 
     # ----------------- training loop -----------------
 
@@ -411,7 +439,6 @@ class AMPOnPolicyRunner:
 
                     mean_task_reward_log += rewards.mean().item()
                     mean_style_reward_log += style_rewards.mean().item()
-
                     rewards = self.task_w * rewards + self.style_w * style_rewards
 
                     self.alg.process_env_step(rewards, dones, infos)

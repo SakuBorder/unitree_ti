@@ -376,15 +376,50 @@ class TiV2Robot(LeggedRobot):
     # #     return torch.exp(-300*torch.sum(torch.square(self.dof_pos[:, [1, 2, 7, 8]]), dim=1))
     
 
-    def _reward_feet_parallel(self):
-        left_foot_left_height = self.rigid_body_states_view[:, [self.left_foot_indices[2]], 2]
-        left_foot_right_height = self.rigid_body_states_view[:, [self.left_foot_indices[4]], 2]
-        left_foot_height_dis = torch.norm(left_foot_left_height - left_foot_right_height, dim=1)
-        right_foot_left_height = self.rigid_body_states_view[:, [self.right_foot_indices[2]], 2]
-        right_foot_right_height = self.rigid_body_states_view[:, [self.right_foot_indices[4]], 2] 
-        right_foot_height_dis = torch.norm(right_foot_left_height - right_foot_right_height, dim=1)
-        return left_foot_height_dis+right_foot_height_dis
+    # def _reward_feet_parallel(self):
+    #     left_foot_left_height = self.rigid_body_states_view[:, [self.left_foot_indices[2]], 2]
+    #     left_foot_right_height = self.rigid_body_states_view[:, [self.left_foot_indices[4]], 2]
+    #     left_foot_height_dis = torch.norm(left_foot_left_height - left_foot_right_height, dim=1)
+    #     right_foot_left_height = self.rigid_body_states_view[:, [self.right_foot_indices[2]], 2]
+    #     right_foot_right_height = self.rigid_body_states_view[:, [self.right_foot_indices[4]], 2] 
+    #     right_foot_height_dis = torch.norm(right_foot_left_height - right_foot_right_height, dim=1)
+    #     return left_foot_height_dis+right_foot_height_dis
     
+    def _reward_feet_parallel(self):
+        """
+        自适应脚底“平行度”惩罚：对每只脚，取所有给定脚部刚体点的 z 高度，
+        用 (max - min) 作为不平度度量；一只脚只有 1 个点时，该值为 0。
+        返回左右脚之和（正数），由 reward scales 的负号转为惩罚。
+        """
+
+        def _to_long_tensor(idxs):
+            # 允许 list/tuple/np/tensor，最后都变成 torch.long
+            if isinstance(idxs, torch.Tensor):
+                t = idxs.to(device=self.device, dtype=torch.long)
+            else:
+                t = torch.as_tensor(list(idxs), device=self.device, dtype=torch.long)
+            return t
+
+        def _foot_spread(idxs):
+            idxs = _to_long_tensor(idxs)
+            if idxs.numel() == 0:
+                # 没有脚点：不惩罚（返回 0），也避免崩溃
+                return torch.zeros(self.num_envs, device=self.device)
+
+            # rigid_body_states_view 形状通常是 [num_envs, num_bodies, 13]，其中 [:,:,2] 是 z 高度
+            # 取该脚所有点的 z，高度矩阵形状 [num_envs, K]
+            z = self.rigid_body_states_view[:, idxs, 2]
+
+            # K==1 时 max==min，自然 spread=0；K>=2 时为真实的高度差
+            spread = z.max(dim=1).values - z.min(dim=1).values
+            return spread  # [num_envs]
+
+        # 左右脚各自的不平度
+        left_spread  = _foot_spread(self.left_foot_indices)
+        right_spread = _foot_spread(self.right_foot_indices)
+
+        # 返回正数，外部用 scales.feet_parallel 的负权重把它变成惩罚
+        return left_spread + right_spread
 
     def _reward_feet_heading_alignment(self):
 

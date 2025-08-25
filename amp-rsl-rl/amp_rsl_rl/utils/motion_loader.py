@@ -2,21 +2,21 @@
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
-
+from isaacgym.torch_utils import quat_rotate, quat_from_angle_axis, quat_mul
 from pathlib import Path
 from typing import List, Union, Tuple, Generator, Optional
 from dataclasses import dataclass
 import os
 import joblib
 
-import torch
+
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
 from scipy.interpolate import interp1d
 
 # === 与环境一致的四元数工具 ===
-from isaacgym.torch_utils import quat_rotate, quat_from_angle_axis, quat_mul
 
+import torch
 
 def download_amp_dataset_from_hf(
     destination_dir: Path,
@@ -88,18 +88,29 @@ def _build_amp_obs_per_step(
     key_body_pos_world: Optional[torch.Tensor],  # (T, K, 3) or None
     expect_dof_obs_dim: int = 12,
     expect_key_bodies: int = 2,
+    use_root_h: Optional[bool] = None,  # 新增：是否使用真实 root_h；None 时走环境变量
 ) -> torch.Tensor:
     """
-    与 Humanoid AMP 对齐的单步观测：
+    与 Humanoid AMP 对齐的单步观测（仍为 43 维/步）：
       [root_h(1), root_rot_tan_norm(6), local_root_vel(3), local_root_ang_vel(3),
        dof_obs(12), dof_vel(12), local_key_body_pos(3*K)] -> K=2 → 43 维
+
+    说明：
+      - 若 use_root_h=False，则 root_h 保留 1 维但数值置 0（与环境端默认行为对齐）。
+      - 默认从环境变量 AMP_USE_ROOT_H 读取（"1" 启用；其他/未设为禁用）。
     """
+    if use_root_h is None:
+        use_root_h = str(os.environ.get("AMP_USE_ROOT_H", "0")) == "1"
+
     T = base_pos_world.shape[0]
     device = base_pos_world.device
     dtype  = base_pos_world.dtype
 
-    # 1) root_h
-    root_h = base_pos_world[:, 2:3]  # (T,1)
+    # 1) root_h（按开关决定是否置零，但维度保留）
+    if use_root_h:
+        root_h = base_pos_world[:, 2:3]  # (T,1)
+    else:
+        root_h = torch.zeros((T, 1), device=device, dtype=dtype)
 
     # 2) 根姿态做 heading 归一 → tan-norm(6)
     heading_inv = _calc_heading_quat_inv(base_quat_xyzw)     # (T,4)
@@ -119,27 +130,25 @@ def _build_amp_obs_per_step(
         dof_obs = torch.cat([dof_pos, torch.zeros(T, pad, device=device, dtype=dtype)], dim=-1)
         dof_vel_obs = torch.cat([dof_vel, torch.zeros(T, pad, device=device, dtype=dtype)], dim=-1)
 
-    # 5) 关键体位：相对根 + 旋到朝向系 → 展平 (T, 3*K)，K=2 不足补零，多了裁剪
+    # 5) 关键体位：相对根 + 旋到朝向系 → 展平 (T, 3*K)
     if key_body_pos_world is None or key_body_pos_world.numel() == 0:
         local_key_flat = torch.zeros((T, 3 * expect_key_bodies), device=device, dtype=dtype)
     else:
         K = key_body_pos_world.shape[1]
         root_pos_expand = base_pos_world.unsqueeze(1)                 # (T,1,3)
         key_rel = key_body_pos_world - root_pos_expand                # (T,K,3)
-
         heading_expand = heading_inv.unsqueeze(1).expand(-1, K, -1)   # (T,K,4)
         key_rel_flat = key_rel.reshape(-1, 3)
         heading_flat = heading_expand.reshape(-1, 4)
         local_key = quat_rotate(heading_flat, key_rel_flat).reshape(T, K, 3)
         local_key_flat = local_key.reshape(T, 3 * K)
-
         if K < expect_key_bodies:
             pad = (expect_key_bodies - K) * 3
             local_key_flat = torch.cat([local_key_flat, torch.zeros(T, pad, device=device, dtype=dtype)], dim=-1)
         elif K > expect_key_bodies:
             local_key_flat = local_key_flat[:, : 3 * expect_key_bodies]
 
-    # 6) 拼接 43 维
+    # 6) 拼接（总维度保持 43）
     obs = torch.cat([
         root_h,
         root_rot_tan_norm,
@@ -149,7 +158,8 @@ def _build_amp_obs_per_step(
         dof_vel_obs,
         local_key_flat,
     ], dim=-1)
-    return obs  # (T, 43)
+    return obs
+
 
 
 @dataclass
@@ -523,6 +533,14 @@ class AMPLoader:
                 rdt = m.get("resampled_dt", "?")
                 rT = m.get("resampled_frames", len(md))
                 print(f"    - {rel} | fmt={fmt} | orig:fps={ofps}, frames={oT} | resampled:dt={rdt}, frames={rT}")
+        with torch.no_grad():
+            try:
+                mean_fwd_list = []
+                for obs in per_file_obs:  # 每个文件的 [T, 43]
+                    mean_fwd_list.append(obs[:, 7].mean().item())  # 7 = local v_x
+                print(f"[AMPLoader] mean local forward speed per-file: {mean_fwd_list} | overall={np.mean(mean_fwd_list):.3f} m/s")
+            except Exception as e:
+                print(f"[AMPLoader] forward-speed stat failed: {e}")
 
     # ---------- 基础插值/数值工具 ----------
 
