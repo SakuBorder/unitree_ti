@@ -11,7 +11,7 @@ import os
 import yaml
 from tqdm import tqdm
 
-from phc.utils import torch_utils
+from amp_rsl_rl.utils import torch_utils
 import joblib
 import torch
 from smpl_sim.poselib.skeleton.skeleton3d import SkeletonMotion, SkeletonState
@@ -19,7 +19,7 @@ import torch.multiprocessing as mp
 import gc
 from scipy.spatial.transform import Rotation as sRot
 import random
-from phc.utils.flags import flags
+from amp_rsl_rl.utils.flags import flags
 from enum import Enum
 USE_CACHE = False
 print("MOVING MOTION DATA TO GPU, USING CACHE:", USE_CACHE)
@@ -127,45 +127,79 @@ class MotionLibBase():
                 self.track_idx = self._motion_data_load[next(iter(self._motion_data_load))].get("track_idx", [19, 24, 29])
         return
         
-    def load_data(self, motion_file,  min_length=-1, im_eval = False):
-        if osp.isfile(motion_file):
-            self.mode = MotionlibMode.file
-            self._motion_data_load = joblib.load(motion_file)
-        else:
-            self.mode = MotionlibMode.directory
-            self._motion_data_load = glob.glob(osp.join(motion_file, "*.pkl"))
-        
-        data_list = self._motion_data_load
+    def load_data(self, motion_file, min_length=-1, im_eval=False):
+        """
+        支持三种输入：
+        1) 单一 .pkl 文件路径：按“file”模式，整包加载为 dict（与原逻辑一致）
+        2) 目录路径：按“directory”模式，**递归**收集目录及子目录里的所有 *.pkl
+        3) 通配/列表：按“directory”模式，把所有匹配到的 *.pkl 汇总
+        目录/通配模式下：
+        - self._motion_data_list / _keys 保存所有文件路径（用于后续采样）
+        - self._motion_data_load 仅加载其中一个示例 pkl（保留旧代码里对元信息的依赖）
+        """
+        def _gather_pkls_from_dir(dir_path: str):
+            files = []
+            for root, _dirs, fns in os.walk(dir_path):
+                for fn in fns:
+                    if fn.endswith(".pkl"):
+                        files.append(os.path.join(root, fn))
+            return files
 
-        if self.mode == MotionlibMode.file:
+        # 统一把输入转成 list 处理，兼容字符串/列表/元组
+        inputs = motion_file if isinstance(motion_file, (list, tuple)) else [motion_file]
+        candidates = []
+
+        for p in inputs:
+            if os.path.isfile(p) and p.endswith(".pkl"):
+                candidates.append(os.path.abspath(p))
+            elif os.path.isdir(p):
+                candidates.extend(_gather_pkls_from_dir(os.path.abspath(p)))
+            else:
+                # 视作通配符
+                for g in glob.glob(p, recursive=True):
+                    if os.path.isfile(g) and g.endswith(".pkl"):
+                        candidates.append(os.path.abspath(g))
+
+        # 如果只有一个文件且是 .pkl，走原来的 "file" 模式（整包 joblib.load 为 dict）
+        if len(candidates) == 1 and candidates[0].endswith(".pkl") and os.path.samefile(candidates[0], inputs[0]):
+            self.mode = MotionlibMode.file
+            self._motion_data_load = joblib.load(candidates[0])
+
+            # file 模式下保留原来的过滤/排序逻辑
             if min_length != -1:
-                data_list = {k: v for k, v in list(self._motion_data_load.items()) if len(v['root_trans_offset']) >= min_length}
+                data_list = {k: v for k, v in list(self._motion_data_load.items())
+                            if len(v['root_trans_offset']) >= min_length}
             elif im_eval:
-                data_list = {item[0]: item[1] for item in sorted(self._motion_data_load.items(), key=lambda entry: len(entry[1]['root_trans_offset']), reverse=True)}
-                # data_list = self._motion_data
+                data_list = {item[0]: item[1] for item in
+                            sorted(self._motion_data_load.items(),
+                                    key=lambda entry: len(entry[1]['root_trans_offset']),
+                                    reverse=True)}
             else:
                 data_list = self._motion_data_load
 
             self._motion_data_list = np.array(list(data_list.values()))
             self._motion_data_keys = np.array(list(data_list.keys()))
-        else:
-            self._motion_data_list = np.array(self._motion_data_load)
-            self._motion_data_keys = np.array(self._motion_data_load)
-        
+            self._num_unique_motions = len(self._motion_data_list)
+            return
+
+        # 否则走“directory/通配”模式：递归/通配聚合到 candidates
+        self.mode = MotionlibMode.directory
+        candidates = sorted(set(candidates))  # 去重 + 排序，便于复现
+        if len(candidates) == 0:
+            raise FileNotFoundError(f"No motion .pkl files found for: {motion_file}")
+
+        # 用全部文件路径作为“可采样集合”
+        self._motion_data_list = np.array(candidates)
+        self._motion_data_keys = np.array(candidates)
         self._num_unique_motions = len(self._motion_data_list)
-        if self.mode == MotionlibMode.directory:
-            # motion_file 是一个目录路径
-            motion_dir = os.path.abspath(motion_file)
-            self._motion_data_load = sorted(glob.glob(os.path.join(motion_dir, '*.pkl')))
 
-            if len(self._motion_data_load) == 0:
-                raise FileNotFoundError(f"No motion .pkl files found in directory: {motion_dir}")
+        # 为了兼容你后面 __init__ 里对 _motion_data_load 当 dict 的读取（如 track_idx），
+        # 这里仅“抽一个样本文件”加载出来放在 _motion_data_load。
+        try:
+            self._motion_data_load = joblib.load(self._motion_data_list[0])
+        except Exception as e:
+            raise RuntimeError(f"Failed to load sample motion file: {self._motion_data_list[0]} ({e})")
 
-            # 加载其中一个作为样本（或者你可以全加载）
-            self._motion_data_load = joblib.load(self._motion_data_load[0])  # sample one file
-        # if self.mode == MotionlibMode.directory:
-        #     import ipdb; ipdb.set_trace()
-        #     self._motion_data_load = joblib.load(self._motion_data_load[0]) # set self._motion_data_load to a sample of the data 
 
     def setup_constants(self, fix_height = FixHeightMode.full_fix, masterfoot_conifg=None, multi_thread = True):
         self._masterfoot_conifg = masterfoot_conifg

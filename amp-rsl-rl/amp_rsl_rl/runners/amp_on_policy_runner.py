@@ -1,4 +1,4 @@
-# ----------------- AMPOnPolicyRunner (optimized) -----------------
+# ----------------- AMPOnPolicyRunner (motionlib version) -----------------
 # Copyright (c) 2025
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -19,9 +19,10 @@ from rsl_rl.modules import ActorCritic, ActorCriticRecurrent
 from rsl_rl.networks import EmpiricalNormalization
 from rsl_rl.utils import store_code_state
 
-from amp_rsl_rl.utils import Normalizer, AMPLoader, export_policy_as_onnx
+from amp_rsl_rl.utils import Normalizer, export_policy_as_onnx
 from amp_rsl_rl.algorithms import AMP_PPO
 from amp_rsl_rl.networks import Discriminator
+from amp_rsl_rl.utils.motion_lib_taihu import MotionLibTaihu  # ✅ 直接导入，KISS
 
 try:
     from amp_rsl_rl.networks import ActorCriticMoE  # type: ignore
@@ -31,6 +32,210 @@ except Exception:
     _HAS_MOE = False
 
 
+# ----------------------------------------------------------------------
+# MotionLib -> AMP adapter
+# ----------------------------------------------------------------------
+from isaacgym.torch_utils import quat_rotate, quat_mul
+
+
+class MotionLibAMPAdapter:
+    """
+    Wrap a MotionLib-like object into an AMP expert 'data source':
+      - sample_pairs via feed_forward_generator(...)
+      - flat observation of length K*D, where K=history_steps and D=per-step features
+    """
+
+    def __init__(
+        self,
+        motion_lib,                     # instance of MotionLibTaihu or compatible
+        dt: float,                      # env control timestep (dt * decimation)
+        history_steps: int = 2,         # K
+        history_stride: int = 1,        # stride (in env dt units)
+        expect_dof_obs_dim: int = 12,   # env dof_obs_size
+        expect_key_bodies: int = 2,     # number of key bodies encoded into obs
+        key_body_ids: Optional[List[int]] = None,  # indices in motion_lib.rg_pos to use
+        use_root_h: bool = False,
+        device: torch.device = torch.device("cpu"),
+    ):
+        self.motion_lib = motion_lib
+        self.dt = float(dt)
+        self.K = max(2, int(history_steps))
+        self.S = max(1, int(history_stride))
+        self.expect_dof_obs_dim = int(expect_dof_obs_dim)
+        self.expect_key_bodies = int(expect_key_bodies)
+        self.key_body_ids = key_body_ids
+        self.use_root_h = bool(use_root_h)
+        self.device = device
+
+        # probe 1 sample to determine per-step dim (D)
+        _probe = self._sample_amp_window(batch_size=1)
+        self.num_amp_obs_per_step = int(_probe["obs"].shape[-1] // self.K)
+        self.sample_item_dim = int(_probe["obs"].shape[-1])  # = K*D
+
+    # ---- AMPLoader-like API ----
+    def feed_forward_generator(self, num_mini_batch: int, mini_batch_size: int):
+        for _ in range(num_mini_batch):
+            out = self._sample_amp_window(batch_size=mini_batch_size)
+            yield out["obs"], out["next_obs"]
+
+    @torch.no_grad()
+    def get_state_for_reset(self, number_of_samples: int) -> Tuple[torch.Tensor, ...]:
+        """
+        Returns: (root_quat_xyzw, dof_pos, dof_vel, v_lin_local, v_ang_local)
+        Shapes:
+          root_quat: [N,4], dof_pos: [N,J], dof_vel: [N,J], v_*: [N,3]
+        """
+        n = int(number_of_samples)
+        if n <= 0:
+            z = torch.empty
+            dev = self.device
+            return z((0, 4), device=dev), z((0, 0), device=dev), z((0, 0), device=dev), z((0, 3), device=dev), z((0, 3), device=dev)
+
+        mids = self.motion_lib.sample_motions(n)
+        t0 = self.motion_lib.sample_time(mids, truncate_time=0.0)
+
+        st = self.motion_lib.get_motion_state(mids, t0)
+        root_rot = st["root_rot"]                # [N,4] xyzw
+        dof_pos = st["dof_pos"]                  # [N,J]
+        dof_vel = st["dof_vel"].reshape(n, -1)   # [N,J]
+        v_lin_w = st["root_vel"]                 # [N,3]
+        v_ang_w = st["root_ang_vel"]             # [N,3]
+
+        heading_inv = calc_heading_quat_inv_xyzw(root_rot)  # [N,4]
+        v_lin_local = quat_rotate(heading_inv, v_lin_w)
+        v_ang_local = quat_rotate(heading_inv, v_ang_w)
+        return (root_rot, dof_pos, dof_vel, v_lin_local, v_ang_local)
+
+    # ---- internal helpers ----
+    @torch.no_grad()
+    def _sample_amp_window(self, batch_size: int):
+        B = int(batch_size)
+        K, S, dt = self.K, self.S, self.dt
+
+        mids = self.motion_lib.sample_motions(B)
+
+        # ensure we can look back K-1 steps of size S*dt
+        truncate_time = (K - 1) * S * dt + 1e-8
+        t0 = self.motion_lib.sample_time(mids, truncate_time=truncate_time) + truncate_time
+
+        steps = torch.arange(0, K, device=self.device, dtype=torch.float32) * (S * dt)
+        times = t0.unsqueeze(1) - steps.unsqueeze(0)    # [B,K]
+        times_next = times + dt                         # slide window forward by +dt
+
+        obs = self._build_flattened_obs(mids, times)
+        next_obs = self._build_flattened_obs(mids, times_next)
+        return {"obs": obs, "next_obs": next_obs}
+
+    def _build_flattened_obs(self, mids: torch.Tensor, times: torch.Tensor) -> torch.Tensor:
+        B, K = times.shape
+        per = []
+        for j in range(K):
+            st = self.motion_lib.get_motion_state(mids, times[:, j])
+
+            key_world = None
+            if self.key_body_ids is not None and "rg_pos" in st:
+                key_world = st["rg_pos"][:, self.key_body_ids, :]  # [B,Kb,3]
+
+            step = build_amp_obs_per_step(
+                base_pos_world=st["root_pos"],
+                base_quat_xyzw=st["root_rot"],
+                base_lin_vel_world=st["root_vel"],
+                base_ang_vel_world=st["root_ang_vel"],
+                dof_pos=st["dof_pos"],
+                dof_vel=st["dof_vel"].reshape(B, -1),
+                key_body_pos_world=key_world,
+                use_root_h=self.use_root_h,
+                expect_dof_obs_dim=self.expect_dof_obs_dim,
+                expect_key_bodies=self.expect_key_bodies,
+            )  # [B,D]
+            per.append(step)
+        return torch.stack(per, dim=1).reshape(B, -1)
+
+
+# ---- math helpers (xyzw convention) ----
+def calc_heading_quat_inv_xyzw(q_xyzw: torch.Tensor) -> torch.Tensor:
+    """Keep only yaw of q (world), return its inverse as xyzw. Matches IsaacGym's AMP heading handling."""
+    try:
+        from amp_rsl_rl.utils import torch_utils
+        return torch_utils.calc_heading_quat_inv(q_xyzw)
+    except Exception:
+        # fallback: identity inverse (no heading) to keep things running
+        q = torch.zeros_like(q_xyzw)
+        q[..., 3] = 1.0
+        return q
+
+
+def quat_to_tan_norm_xyzw(q_xyzw: torch.Tensor) -> torch.Tensor:
+    try:
+        from amp_rsl_rl.utils import torch_utils
+        return torch_utils.quat_to_tan_norm(q_xyzw)
+    except Exception:
+        # fallback: raw quaternion padded to 6D
+        pad = torch.zeros(q_xyzw.shape[:-1] + (2,), device=q_xyzw.device, dtype=q_xyzw.dtype)
+        return torch.cat([q_xyzw[..., :4], pad], dim=-1)
+
+
+def build_amp_obs_per_step(
+    base_pos_world: torch.Tensor,      # [B,3]
+    base_quat_xyzw: torch.Tensor,      # [B,4]
+    base_lin_vel_world: torch.Tensor,  # [B,3]
+    base_ang_vel_world: torch.Tensor,  # [B,3]
+    dof_pos: torch.Tensor,             # [B,J]
+    dof_vel: torch.Tensor,             # [B,J]
+    key_body_pos_world: Optional[torch.Tensor],  # [B,Kb,3] or None
+    use_root_h: bool,
+    expect_dof_obs_dim: int,
+    expect_key_bodies: int,
+) -> torch.Tensor:
+    B = base_pos_world.shape[0]
+    dev, dtype = base_pos_world.device, base_pos_world.dtype
+
+    # root height
+    root_h = base_pos_world[:, 2:3] if use_root_h else torch.zeros((B, 1), device=dev, dtype=dtype)
+
+    # heading & local root rot (tan-norm 6D)
+    heading_inv = calc_heading_quat_inv_xyzw(base_quat_xyzw)          # [B,4]
+    root_local = quat_mul(heading_inv, base_quat_xyzw)                # [B,4]
+    root_rot_tan = quat_to_tan_norm_xyzw(root_local)                  # [B,6]
+
+    # local root velocities
+    v_lin_local = quat_rotate(heading_inv, base_lin_vel_world)        # [B,3]
+    v_ang_local = quat_rotate(heading_inv, base_ang_vel_world)        # [B,3]
+
+    # dof pos/vel (crop or pad to expect_dof_obs_dim)
+    Jexp = int(expect_dof_obs_dim)
+    if dof_pos.shape[1] >= Jexp:
+        dof_obs = dof_pos[:, :Jexp]
+        dof_vel_obs = dof_vel[:, :Jexp]
+    else:
+        pad = Jexp - dof_pos.shape[1]
+        z = torch.zeros((B, pad), device=dev, dtype=dtype)
+        dof_obs = torch.cat([dof_pos, z], dim=-1)
+        dof_vel_obs = torch.cat([dof_vel, z], dim=-1)
+
+    # key bodies: relative to root, rotated by heading_inv
+    Kbexp = int(expect_key_bodies)
+    if key_body_pos_world is None or key_body_pos_world.numel() == 0:
+        key_local_flat = torch.zeros((B, 3 * Kbexp), device=dev, dtype=dtype)
+    else:
+        Kb = key_body_pos_world.shape[1]
+        rel = key_body_pos_world - base_pos_world.unsqueeze(1)        # [B,Kb,3]
+        h_flat = heading_inv.unsqueeze(1).expand(-1, Kb, -1).reshape(-1, 4)
+        rel_flat = rel.reshape(-1, 3)
+        local = quat_rotate(h_flat, rel_flat).reshape(B, Kb, 3)       # [B,Kb,3]
+        key_local_flat = local.reshape(B, 3 * Kb)
+        if Kb < Kbexp:
+            pad = (Kbexp - Kb) * 3
+            key_local_flat = torch.cat([key_local_flat, torch.zeros((B, pad), device=dev, dtype=dtype)], dim=-1)
+        elif Kb > Kbexp:
+            key_local_flat = key_local_flat[:, : 3 * Kbexp]
+
+    return torch.cat([root_h, root_rot_tan, v_lin_local, v_ang_local, dof_obs, dof_vel_obs, key_local_flat], dim=-1)
+
+
+# ----------------------------------------------------------------------
+# Utilities for env unpacking
+# ----------------------------------------------------------------------
 def _unpack_env_observations(env: VecEnv) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     got = env.get_observations()
     if isinstance(got, tuple):
@@ -61,18 +266,26 @@ def _unpack_env_step(ret: Any) -> Tuple[
 def _merge_amp_cfg(train_cfg: Dict[str, Any]) -> Dict[str, Any]:
     amp = dict(train_cfg.get("amp", {}))
     for k in (
+        # legacy keys (kept so older cfgs still work)
         "amp_data_path", "dataset_names", "dataset_weights", "slow_down_factor",
         "num_amp_obs", "dt", "decimation", "replay_buffer_size", "reward_scale",
         "joint_names", "style_weight", "task_weight",
-        "num_amp_obs_steps", "history_steps", "history_stride"
+        "num_amp_obs_steps", "history_steps", "history_stride",
+        # motionlib-centric keys
+        "motion_file", "mjcf_file", "extend_hand", "extend_head",
+        "expect_dof_obs_dim", "key_body_ids", "bootstrap_motions", "motionlib_class",
+        "use_joint_mapping", "debug_joint_mapping",
     ):
         if k in train_cfg and k not in amp:
             amp[k] = train_cfg[k]
     return amp
 
 
+# ----------------------------------------------------------------------
+# AMPOnPolicyRunner (KISS import for MotionLibTaihu)
+# ----------------------------------------------------------------------
 class AMPOnPolicyRunner:
-    """AMP + PPO Runner (TensorBoard only, KISS + memory safe)."""
+    """AMP + PPO Runner (TensorBoard only, memory-safe). MotionLib-backed expert sampling."""
 
     def __init__(self, env: VecEnv, train_cfg, log_dir=None, device="cpu"):
         from pathlib import Path
@@ -127,7 +340,7 @@ class AMPOnPolicyRunner:
             **policy_kwargs,
         ).to(self.device)
 
-        # --- AMP timing ---
+        # --- AMP timing (dt, decimation) ---
         dt_cfg = getattr(getattr(self.env, "cfg", None), "sim", None)
         dt = getattr(dt_cfg, "dt", None)
         deci_cfg = getattr(getattr(self.env, "cfg", None), "control", None)
@@ -147,41 +360,26 @@ class AMPOnPolicyRunner:
         if history_steps is None:
             history_steps = self.amp_cfg.get("num_amp_obs_steps", None)
         if history_steps is None:
-            history_steps = getattr(self.env, "_num_amp_obs_steps", 1)
-        history_stride = self.amp_cfg.get("history_stride", 1)
+            history_steps = getattr(self.env, "_num_amp_obs_steps", 2)
+        history_steps = int(history_steps)
+        history_stride = int(self.amp_cfg.get("history_stride", 1))
 
-        joint_names = self.amp_cfg.get("joint_names", None)
+        # --- MotionLib config ---
         amp_data_path = self.amp_cfg.get("amp_data_path", None)
-        dataset_names = list(self.amp_cfg.get("dataset_names", []) or [])
-        dataset_weights = list(self.amp_cfg.get("dataset_weights", []) or [])
-        slow_down_factor = self.amp_cfg.get("slow_down_factor", 1)
+        motion_file = self.amp_cfg.get("motion_file", None) or amp_data_path
+        if motion_file is None:
+            raise RuntimeError("AMP config requires 'motion_file' (or legacy 'amp_data_path').")
 
-        if amp_data_path is None:
-            raise RuntimeError("AMP config requires 'amp_data_path'.")
-        root = Path(amp_data_path)
+        mjcf_file = self.amp_cfg.get("mjcf_file", "/home/dy/dy/code/unitree_ti/assert/ti5/ti5_12dof.xml")
+        extend_hand = bool(self.amp_cfg.get("extend_hand", True))
+        extend_head = bool(self.amp_cfg.get("extend_head", True))
+        expect_dof_obs_dim = int(self.amp_cfg.get("expect_dof_obs_dim", 12))
+        key_body_ids = self.amp_cfg.get("key_body_ids", [6, 12])  # default: L/R ankles in many rigs
+        bootstrap_motions = int(self.amp_cfg.get("bootstrap_motions", min(32, getattr(self.env, "num_envs", 32))))
+        use_joint_mapping = bool(self.amp_cfg.get("use_joint_mapping", True))
+        debug_joint_mapping = bool(self.amp_cfg.get("debug_joint_mapping", False))
 
-        if len(dataset_names) == 1:
-            maybe_dir = root / dataset_names[0]
-            if maybe_dir.is_dir():
-                exts = {".npy", ".npz", ".pt", ".pkl"}
-                files = [p for p in maybe_dir.iterdir() if p.is_file() and p.suffix in exts]
-                files.sort()
-                if len(files) == 0:
-                    print(f"[AMP DATA] Warning: directory '{maybe_dir}' is empty or has no supported files {sorted(list(exts))}.")
-                dataset_names = [f"{maybe_dir.name}/{p.stem}" for p in files]
-                if len(dataset_weights) != len(dataset_names):
-                    dataset_weights = [1.0] * len(dataset_names)
-                print(f"[AMP DATA] Expanded directory '{maybe_dir}': {len(dataset_names)} files found.")
-            elif not maybe_dir.exists():
-                print(f"[AMP DATA] Note: '{maybe_dir}' not a directory; will treat '{dataset_names[0]}' as a single clip name.")
-
-        if dataset_weights and len(dataset_weights) != len(dataset_names):
-            if len(dataset_weights) > len(dataset_names):
-                dataset_weights = dataset_weights[:len(dataset_names)]
-            else:
-                dataset_weights = dataset_weights + [1.0] * (len(dataset_names) - len(dataset_weights))
-
-        # --- set loader flag for root height before building AMPLoader ---
+        # --- use_root_h flag from env.observations.amp.root_height ---
         use_root_h = bool(
             getattr(getattr(self.env, "cfg", None), "observations", None)
             and getattr(self.env.cfg.observations, "amp", None)
@@ -189,22 +387,66 @@ class AMPOnPolicyRunner:
         )
         os.environ["AMP_USE_ROOT_H"] = "1" if use_root_h else "0"
 
-        # build expert data
-        amp_data = AMPLoader(
-            self.device,
-            str(root),
-            dataset_names,
-            dataset_weights,
-            delta_t,
-            slow_down_factor,
-            joint_names,
+        # --- Instantiate MotionLib (KISS: use the imported class directly) ---
+        # Optional: honor a different 'motionlib_class' value, but still use MotionLibTaihu (compatibility)
+        motionlib_class_name = self.amp_cfg.get("motionlib_class", "MotionLibTaihu")
+        if motionlib_class_name != "MotionLibTaihu":
+            print(f"[AMPOnPolicyRunner] motionlib_class='{motionlib_class_name}' not supported in KISS mode; using MotionLibTaihu.")
+
+        motion_lib = MotionLibTaihu(
+            motion_file=motion_file,
+            device=self.device,
+            mjcf_file=mjcf_file,
+            extend_hand=extend_hand,
+            extend_head=extend_head,
+            sim_timestep=delta_t,
+        )
+        if hasattr(motion_lib, "set_joint_mapping_mode"):
+            motion_lib.set_joint_mapping_mode(use_mapping=use_joint_mapping, debug=debug_joint_mapping)
+
+        # --- Bootstrap motions once ---
+        node_names = getattr(motion_lib.mesh_parsers, "model_names", None) or getattr(motion_lib.mesh_parsers, "body_names", None)
+        if node_names is None:
+            raise RuntimeError("MotionLib.mesh_parsers must expose 'model_names' or 'body_names'.")
+
+        class _Skel:
+            __slots__ = ("node_names",)
+            def __init__(self, names): self.node_names = names
+
+        num_boot = max(1, bootstrap_motions)
+        skeleton_trees = [_Skel(node_names) for _ in range(num_boot)]
+        gender_betas = [torch.zeros(17) for _ in range(num_boot)]  # placeholder
+        limb_weights = [1.0] * len(node_names)
+
+        motion_lib.load_motions(
+            skeleton_trees=skeleton_trees,
+            gender_betas=gender_betas,
+            limb_weights=limb_weights,
+            random_sample=True,
+            start_idx=0,
+            max_len=-1,
+            target_heading=None,
+        )
+
+        # --- Build adapter (replaces AMPLoader) ---
+        amp_data = MotionLibAMPAdapter(
+            motion_lib=motion_lib,
+            dt=delta_t,
             history_steps=history_steps,
             history_stride=history_stride,
+            expect_dof_obs_dim=expect_dof_obs_dim,
+            expect_key_bodies=len(key_body_ids),
+            key_body_ids=key_body_ids,
+            use_root_h=use_root_h,
+            device=self.device,
         )
         self.amp_data = amp_data
 
+        # Allow env to access amp_data if it wants (e.g., reset from motion states)
         if hasattr(self.env, "set_amp_data"):
             self.env.set_amp_data(self.amp_data)
+
+        # Try initial reset
         try:
             all_ids = torch.arange(self.env.num_envs, device=self.device, dtype=torch.long)
             if hasattr(self.env, "reset_idx"):
@@ -214,87 +456,33 @@ class AMPOnPolicyRunner:
         except Exception as e:
             print(f"[Runner] Soft-warn: initial AMP reset failed: {e}")
 
-        # --- dataset summary (printed once) ---
-        def _get_attr_any(obj, names):
-            for name in names:
-                if hasattr(obj, name):
-                    v = getattr(obj, name)
-                    if v is not None:
-                        return v
-            return None
-
-        num_pairs = _get_attr_any(amp_data, [
-            "num_pairs", "num_samples", "size", "N", "length", "total_pairs", "total_samples"
-        ])
-        if num_pairs is None:
-            try:
-                num_pairs = len(amp_data)
-            except Exception:
-                num_pairs = "unknown"
-
-        _ds = dataset_names or []
-        _ws = dataset_weights or []
-        if not _ws:
-            _ws = [1.0] * len(_ds)
-        datasets_line = ", ".join([f"{n}(w={w})" for n, w in zip(_ds, _ws)])
-
-        container = _get_attr_any(amp_data, ["datasets", "clips", "sequences", "items", "sources"])
-        details_lines = []
-        if isinstance(container, (list, tuple)):
-            show_k = min(12, len(container))
-            for i in range(show_k):
-                item = container[i]
-                name = _get_attr_any(item, ["name", "id", "file", "path", "basename"]) or f"item_{i}"
-                length = _get_attr_any(item, ["num_pairs", "num_samples", "length", "size", "N"])
-                if length is None:
-                    try:
-                        length = len(item)
-                    except Exception:
-                        length = "?"
-                details_lines.append(f"  - #{i}: {name}, len={length}")
-            if len(container) > show_k:
-                details_lines.append(f"  - ... (+{len(container)-show_k} more)")
-
+        # --- dataset summary ---
+        num_motions = getattr(motion_lib, "num_motions", lambda: None)()
+        total_len = getattr(motion_lib, "get_total_length", lambda: None)()
         sample_preview = "n/a"
         try:
-            sampler = getattr(amp_data, "sample_pairs", None)
-            if callable(sampler):
-                sample = amp_data.sample_pairs(2)
-                def _shape_of(x):
-                    if isinstance(x, torch.Tensor):
-                        return tuple(x.shape)
-                    if hasattr(x, "shape"):
-                        return tuple(x.shape)
-                    try:
-                        return f"len={len(x)}"
-                    except Exception:
-                        return type(x).__name__
-                if isinstance(sample, (list, tuple)):
-                    shapes = ", ".join(_shape_of(v) for v in sample)
-                    sample_preview = f"tuple[{len(sample)}]: {shapes}"
-                elif isinstance(sample, dict):
-                    parts = [f"{k}:{_shape_of(v)}" for k, v in sample.items()]
-                    sample_preview = "{ " + ", ".join(parts) + " }"
-                else:
-                    sample_preview = f"type={type(sample).__name__}"
+            g = amp_data.feed_forward_generator(num_mini_batch=1, mini_batch_size=2)
+            ex_obs, ex_next = next(g)
+            sample_preview = f"obs={tuple(ex_obs.shape)}, next_obs={tuple(ex_next.shape)}"
         except Exception as e:
             sample_preview = f"peek failed: {e}"
 
-        pairs_txt = f"{num_pairs}" if isinstance(num_pairs, (int, float)) else str(num_pairs)
-        details_block = "\n".join(details_lines) if details_lines else "(no per-dataset detail available)"
+        from pathlib import Path
         self._amp_data_text = (
-            f"path: {str(root)}\n"
-            f"datasets: {datasets_line if datasets_line else '<none>'}\n"
-            f"delta_t={delta_t:.6f}, decimation={decimation}, slow_down_factor={slow_down_factor}\n"
-            f"num_amp_obs={num_amp_obs}, disc_input_dim={num_amp_obs * 2}\n"
-            f"history_steps={int(history_steps)}, history_stride={int(history_stride)}\n"
-            f"estimated_pairs={pairs_txt}\n"
-            f"per-dataset:\n{details_block}\n"
-            f"sample_pairs preview: {sample_preview}"
+            f"motion_file: {Path(motion_file)}\n"
+            f"mjcf_file: {mjcf_file}\n"
+            f"motions_loaded: {num_motions if num_motions is not None else 'n/a'}\n"
+            f"total_length(s): {total_len:.3f}" if isinstance(total_len, (int, float)) else "total_length(s): n/a"
         )
-        print("[AMP DATA] ==== Expert dataset summary ====")
+        print("[AMP DATA] ==== MotionLib summary ====")
         for line in self._amp_data_text.splitlines():
             print("[AMP DATA] " + line)
+        print(
+            f"[AMP DATA] delta_t={delta_t:.6f}, history_steps={int(history_steps)}, "
+            f"history_stride={int(history_stride)}, expect_dof_obs_dim={expect_dof_obs_dim}, "
+            f"key_body_ids={key_body_ids}"
+        )
+        print(f"[AMP DATA] sample preview: {sample_preview}")
         print("[AMP DATA] =================================")
 
         # --- AMP bits ---
@@ -308,12 +496,11 @@ class AMPOnPolicyRunner:
         ).to(self.device)
 
         # --- sanity checks (AFTER discriminator is created) ---
-        # --- sanity checks (AFTER discriminator is created) ---
         if self.amp_data.sample_item_dim != num_amp_obs:
             raise ValueError(
-                f"AMP obs dim mismatch: env={num_amp_obs}, data={self.amp_data.sample_item_dim}"
+                f"AMP obs dim mismatch: env={num_amp_obs}, data={self.amp_data.sample_item_dim} (K*D). "
+                f"Check history_steps/stride, expect_dof_obs_dim, key_body_ids, and env's AMP obs definition."
             )
-
         disc_expected = 2 * num_amp_obs
         if self.discriminator.input_dim != disc_expected:
             raise ValueError(
@@ -341,8 +528,6 @@ class AMPOnPolicyRunner:
             device=self.device,
             **algo_kwargs,
         )
-
-
 
         # --- rollout/logging ---
         self.num_steps_per_env = int(self.runner_cfg.get("num_steps_per_env", 24))
@@ -373,8 +558,6 @@ class AMPOnPolicyRunner:
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
-
-
 
     # ----------------- training loop -----------------
 
@@ -451,7 +634,6 @@ class AMPOnPolicyRunner:
                         critic_fixed[term_ids] = term_priv.clone().detach()
                         critic_next = critic_fixed
 
-                    # ---- KISS: no clone, just detach to avoid graph refs ----
                     obs = obs_next
                     critic_obs = critic_next
                     amp_obs = next_amp_obs.detach()
@@ -528,7 +710,6 @@ class AMPOnPolicyRunner:
                     f"| style_reward(avg/step)={mean_style_reward_avg:.4f}"
                 )
 
-            # ---- KISS: pass only necessary scalars to log(), avoid big locals() ----
             if self.writer is not None:
                 to_log = {
                     "it": it,
@@ -642,8 +823,16 @@ class AMPOnPolicyRunner:
             mean_std = float("nan")
         fps = int(self.num_steps_per_env * self.env.num_envs / (locs["collection_time"] + locs["learn_time"]))
 
-        self.writer.add_scalar("Loss/value_function", locs["mean_value_loss"], locs["it"])
-        self.writer.add_scalar("Loss/surrogate", locs["mean_surrogate_loss"], locs["it"])
+        # ======== 明确区分 Actor 与 Critic 的 loss 命名 ========
+        # 保持原有记录（兼容旧看板）
+        self.writer.add_scalar("Loss/value_function", locs["mean_value_loss"], locs["it"])   # == Critic loss
+        self.writer.add_scalar("Loss/surrogate", locs["mean_surrogate_loss"], locs["it"])    # == Actor loss(=surrogate)
+
+        # 新增更明确的命名
+        self.writer.add_scalar("Critic/Loss", locs["mean_value_loss"], locs["it"])
+        self.writer.add_scalar("Actor/Loss", locs["mean_surrogate_loss"], locs["it"])
+
+        # 其余保持不变
         self.writer.add_scalar("Loss/amp_loss", locs["mean_amp_loss"], locs["it"])
         self.writer.add_scalar("Loss/grad_pen_loss", locs["mean_grad_pen_loss"], locs["it"])
         self.writer.add_scalar("Loss/policy_pred", locs["mean_policy_pred"], locs["it"])
@@ -673,8 +862,8 @@ class AMPOnPolicyRunner:
             f"""{'#' * width}\n"""
             f"""{head.center(width, ' ')}\n\n"""
             f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs['collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
-            f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
-            f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
+            f"""{'Critic loss (value):':>{pad}} {locs['mean_value_loss']:.4f}\n"""
+            f"""{'Actor loss (surrogate):':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
             f"""{'AMP loss:':>{pad}} {locs['mean_amp_loss']:.4f}\n"""
             f"""{'Grad penalty:':>{pad}} {locs['mean_grad_pen_loss']:.4f}\n"""
             f"""{'Disc policy_pred (~P(policy)):':>{pad}} {locs['mean_policy_pred']:.4f}\n"""
@@ -701,6 +890,7 @@ class AMPOnPolicyRunner:
             f"""{'ETA:':>{pad}} {int(eta_h)}h {int(eta_m)}m {int(eta_s)}s\n"""
         )
         print(log_string)
+
 
     def save(self, path, infos=None, save_onnx=False):
         saved_dict = {

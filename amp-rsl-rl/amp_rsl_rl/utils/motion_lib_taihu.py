@@ -4,22 +4,22 @@ import yaml
 from tqdm import tqdm
 import os.path as osp
 
-from phc.utils import torch_utils
+from amp_rsl_rl.utils import torch_utils
 import joblib
 import torch
 import torch.multiprocessing as mp
 import copy
 import gc
-from phc.smpllib.smpl_parser import (
+from amp_rsl_rl.utils.smpllib.smpl_parser import (
     SMPL_Parser,
     SMPLH_Parser,
     SMPLX_Parser,
 )
 from scipy.spatial.transform import Rotation as sRot
 import random
-from phc.utils.flags import flags
-from phc.utils.motion_lib_base import MotionLibBase, DeviceCache, compute_motion_dof_vels, FixHeightMode
-from phc.utils.torch_taihu_humanoid_batch import Taihu_Humanoid_Batch
+from amp_rsl_rl.utils.flags import flags
+from amp_rsl_rl.utils.motion_lib_base import MotionLibBase, DeviceCache, compute_motion_dof_vels, FixHeightMode
+from amp_rsl_rl.utils.torch_taihu_humanoid_batch import Taihu_Humanoid_Batch
 from easydict import EasyDict
 
 def to_torch(tensor):
@@ -56,8 +56,7 @@ class MotionLibTaihu(MotionLibBase):
         
         self.mesh_parsers = Taihu_Humanoid_Batch(extend_hand=extend_hand, extend_head=extend_head, mjcf_file=mjcf_file)
         dof_axis = self.mesh_parsers.dof_axis
-        self.isaac_gym_joint_mapping = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 
-                                       18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
+        self.isaac_gym_joint_mapping = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
         
         self.use_joint_mapping = True
         self.debug_dof = False
@@ -144,12 +143,13 @@ class MotionLibTaihu(MotionLibBase):
 
         manager = mp.Manager()
         queue = manager.Queue()
-        num_jobs = min(mp.cpu_count(), 64)
+        num_jobs = 1 
+        # num_jobs = min(mp.cpu_count(), 64)
 
-        if num_jobs <= 8 or not self.multi_thread:
-            num_jobs = 1
-        if flags.debug:
-            num_jobs = 1
+        # if num_jobs <= 8 or not self.multi_thread:
+        #     num_jobs = 1
+        # if flags.debug:
+        #     num_jobs = 1
         
         res_acc = {}
         jobs = motion_data_list
@@ -422,7 +422,7 @@ class MotionLibTaihu(MotionLibBase):
         
     @staticmethod
     def load_motion_with_skeleton(ids, motion_data_list, skeleton_trees, gender_betas, fix_height, 
-                                 mesh_parsers, masterfoot_config, target_heading, max_len, queue, pid):
+                                mesh_parsers, masterfoot_config, target_heading, max_len, queue, pid):
 
         np.random.seed(np.random.randint(5000) * pid)
         res = {}
@@ -431,10 +431,66 @@ class MotionLibTaihu(MotionLibBase):
         for f in range(len(motion_data_list)):
             curr_id = ids[f]
             curr_file = motion_data_list[f]
+            
             if not isinstance(curr_file, dict) and osp.isfile(curr_file):
-                key = motion_data_list[f].split("/")[-1].split(".")[0]
-                curr_file = joblib.load(curr_file)[key]
+                # 直接加载pkl文件
+                loaded_data = joblib.load(curr_file)
+                
+                # 如果加载的数据直接就是运动数据字典
+                if isinstance(loaded_data, dict) and 'root_trans_offset' in loaded_data:
+                    curr_file = loaded_data
+                # 如果加载的数据是包含运动数据的字典
+                elif isinstance(loaded_data, dict):
+                    # 从文件名推导key
+                    filename = motion_data_list[f].split("/")[-1].split(".")[0]
+                    
+                    # 尝试各种可能的key匹配
+                    possible_keys = [
+                        filename,
+                        filename.replace('_poses', ''),
+                        filename.replace(' t2_poses', '_poses'),
+                    ]
+                    
+                    # 添加所有包含文件名的key
+                    for key in loaded_data.keys():
+                        if filename in str(key) or str(key).endswith(filename):
+                            possible_keys.append(key)
+                    
+                    # 尝试匹配key
+                    matched_key = None
+                    for key in possible_keys:
+                        if key in loaded_data:
+                            matched_key = key
+                            break
+                    
+                    if matched_key is not None:
+                        curr_file = loaded_data[matched_key]
+                        if pid == 0:  # 只在主进程打印
+                            print(f"[MotionLibTaihu] Using key '{matched_key}' for file {filename}")
+                    else:
+                        # 如果都找不到，使用第一个可用的key
+                        first_key = list(loaded_data.keys())[0]
+                        curr_file = loaded_data[first_key]
+                        if pid == 0:  # 只在主进程打印警告
+                            print(f"[MotionLibTaihu] Warning: key '{filename}' not found in {motion_data_list[f]}. "
+                                f"Available keys: {list(loaded_data.keys())[:5]}{'...' if len(loaded_data.keys()) > 5 else ''}. "
+                                f"Using fallback key '{first_key}'.")
+                else:
+                    raise ValueError(f"Unexpected data structure in {motion_data_list[f]}: {type(loaded_data)}")
+            
+            # 验证数据结构
+            if not isinstance(curr_file, dict):
+                raise ValueError(f"Expected dict data structure, got {type(curr_file)} for file {motion_data_list[f]}")
+            
+            # 检查必需的字段
+            required_fields = ['root_trans_offset', 'pose_aa', 'fps']
+            missing_fields = [field for field in required_fields if field not in curr_file]
+            if missing_fields:
+                available_fields = list(curr_file.keys())
+                raise ValueError(f"Missing required fields {missing_fields} in {motion_data_list[f]}. "
+                            f"Available fields: {available_fields}")
 
+            # 处理序列长度
             seq_len = curr_file['root_trans_offset'].shape[0]
             if max_len == -1 or seq_len < max_len:
                 start, end = 0, seq_len
@@ -442,12 +498,14 @@ class MotionLibTaihu(MotionLibBase):
                 start = random.randint(0, seq_len - max_len)
                 end = start + max_len
 
+            # 提取运动数据
             trans = to_torch(curr_file['root_trans_offset']).clone()[start:end]
             pose_aa = to_torch(curr_file['pose_aa'][start:end]).clone()
             dt = 1/curr_file['fps']
 
             B, J, N = pose_aa.shape
 
+            # 处理目标朝向
             if target_heading is not None:
                 start_root_rot = sRot.from_rotvec(pose_aa[0, 0])
                 heading_inv_rot = sRot.from_quat(torch_utils.calc_heading_quat_inv(
@@ -456,8 +514,12 @@ class MotionLibTaihu(MotionLibBase):
                 pose_aa[:, 0] = torch.tensor((heading_delta * sRot.from_rotvec(pose_aa[:, 0])).as_rotvec())
                 trans = torch.matmul(trans, torch.from_numpy(heading_delta.as_matrix().squeeze().T))
 
-            curr_motion = mesh_parsers.fk_batch(pose_aa[None, ], trans[None, ], return_full=True, dt=dt)
-            curr_motion = EasyDict({k: v.squeeze() if torch.is_tensor(v) else v for k, v in curr_motion.items()})
+            # 执行前向运动学
+            try:
+                curr_motion = mesh_parsers.fk_batch(pose_aa[None, ], trans[None, ], return_full=True, dt=dt)
+                curr_motion = EasyDict({k: v.squeeze() if torch.is_tensor(v) else v for k, v in curr_motion.items()})
+            except Exception as e:
+                raise RuntimeError(f"Forward kinematics failed for {motion_data_list[f]}: {e}")
             
             res[curr_id] = (curr_file, curr_motion)
 

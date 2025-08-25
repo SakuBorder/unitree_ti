@@ -1,6 +1,6 @@
 import torch 
 import numpy as np
-import phc.utils.rotation_conversions as tRot
+import amp_rsl_rl.utils.rotation_conversions as tRot
 import xml.etree.ElementTree as ETree
 from easydict import EasyDict
 import scipy.ndimage.filters as filters

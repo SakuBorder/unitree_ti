@@ -396,18 +396,15 @@ class TiV2AMPRobot(TiV2Robot):
         self._init_amp_obs_for_reset(env_ids)
 
     def fetch_amp_obs_demo(self, num_samples):
-        if (not self._enable_amp) or self._amp_obs_buf is None:
+        if not self._enable_amp or self._amp_obs_buf is None:
             return torch.zeros((num_samples, 0), device=self.device)
         if self.amp_data is None:
             return torch.zeros((num_samples, self.num_amp_obs), device=self.device)
         try:
-            demo_obs_list = []
-            for _ in range(self._num_amp_obs_steps):
-                quat_xyzw, qpos, qvel, vlin_local, vang_local = self.amp_data.get_state_for_reset(num_samples)
-                demo = torch.cat([qpos.to(self.device), qvel.to(self.device), vlin_local.to(self.device), vang_local.to(self.device)], dim=-1)
-                demo_obs_list.append(demo)
-            amp_obs_demo = torch.stack(demo_obs_list, dim=1)
-            return amp_obs_demo.reshape(num_samples, -1)
+            gen = self.amp_data.feed_forward_generator(num_mini_batch=1, mini_batch_size=int(num_samples))
+            obs, _ = next(gen)  # obs: [N, K*D]
+            return obs.to(self.device, non_blocking=True)
         except Exception as e:
             print(f"[TiV2AMPRobot] Warning: fetch_amp_obs_demo failed ({e}), returning zeros")
             return torch.zeros((num_samples, self.num_amp_obs), device=self.device)
+
