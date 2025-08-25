@@ -2,6 +2,7 @@ import os
 import sys
 import numpy as np
 from isaacgym import gymapi, gymutil, gymtorch
+from isaacgym.torch_utils import quat_mul, quat_rotate
 
 sys.path.append(os.getcwd())
 
@@ -371,16 +372,33 @@ while not gym.query_viewer_has_closed(viewer):
                 motion_time_wrapped = motion_time % motion_len
 
                 motion_res = motion_lib.get_motion_state(
-                    torch.tensor([motion_id]).to(args.compute_device_id), 
+                    torch.tensor([motion_id]).to(args.compute_device_id),
                     torch.tensor([motion_time_wrapped]).to(args.compute_device_id)
                 )
-                import ipdb;ipdb.set_trace()
                 root_pos = motion_res["root_pos"]
-                root_rot = motion_res["root_rot"] 
+                root_rot = motion_res["root_rot"]
                 dof_pos = motion_res["dof_pos"]
 
                 root_vel = motion_res["root_vel"]
                 root_ang_vel = motion_res["root_ang_vel"]
+
+                # rotate from original Y-up to Z-up
+                y_to_z_quat = torch.tensor(
+                    [np.sqrt(0.5), 0.0, 0.0, np.sqrt(0.5)],
+                    device=root_rot.device,
+                    dtype=root_rot.dtype,
+                ).repeat(root_rot.shape[0], 1)
+
+                rot_mat = torch.tensor(
+                    [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]],
+                    device=root_pos.device,
+                    dtype=root_pos.dtype,
+                )
+
+                root_rot = quat_mul(y_to_z_quat, root_rot)
+                root_pos = root_pos @ rot_mat.T
+                root_vel = root_vel @ rot_mat.T
+                root_ang_vel = root_ang_vel @ rot_mat.T
 
                 if debug_mode and int(motion_time * 10) % 30 == 0: 
                     print(f"\n=== Motion Debug Info (t={motion_time:.2f}) ===")
@@ -403,7 +421,7 @@ while not gym.query_viewer_has_closed(viewer):
                         dof_pos_clamped[0][i] = torch.clamp(dof_pos_clamped[0][i], -3.14, 3.14)
 
                 if "rg_pos" in motion_res:
-                    rb_pos = motion_res["rg_pos"]
+                    rb_pos = motion_res["rg_pos"] @ rot_mat.T
                     gym.clear_lines(viewer)
                     gym.refresh_rigid_body_state_tensor(sim)
 
